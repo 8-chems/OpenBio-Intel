@@ -106,6 +106,48 @@ flowchart TB
 
 **Why federate across six collections instead of one?** Different questions need different evidence. "What's Merck's stated pipeline strategy?" needs SEC filings, not trial registries. "What's the reported ORR for this combination?" needs conference-poster efficacy tables, not a registry's design summary. Each tool is scoped to what its corpus can actually answer, and the agent decides which to call — not a single undifferentiated blob of "everything."
 
+### End-to-End Query Lifecycle & Execution Flow
+
+When a user submits a query (e.g., *"Which Phase 3 trials use pembrolizumab, and what are they combining it with?"*), the pipeline executes across five distinct stages:
+
+1. **Deterministic Intent Gate (`IntentClassifier`)**:
+   - The query is screened before vector retrieval occurs.
+   - Built-in regex pre-screening (`_is_obviously_clinical`) prevents false-negative refusals on established biopharma and clinical terminology (*Phase 3*, *oncology*, *readout*, drug names).
+   - Completely non-clinical queries fail closed deterministically without invoking Qdrant or LLM synthesis.
+
+2. **Exact Entity Resolution (`Neo4j`)**:
+   - The agent resolves the queried drug against the Neo4j RxNorm knowledge graph via Cypher traversal.
+   - E.g., *"Keytruda"* deterministically expands to *"pembrolizumab"*, *"MK-3475"*, and RxCUI `1547545`. This matches trials using developmental codes or trade names with zero fuzzy hallucination.
+
+3. **Hybrid Federated Retrieval (`Qdrant`)**:
+   - Executes multi-source retrieval across independent vector collections (`clinical_trials`, `openfda_drugsfda`, `pubmed_literature`, `sec_filings`, `corporate_news`, `fda_crls`).
+   - Combines dense embeddings (semantic meaning) with sparse BM25 (exact terminology) fused server-side in Qdrant with cross-encoder reranking.
+   - Guarded by `_safe_query_points` so sparse or unseeded secondary collections degrade gracefully without throwing 404 errors.
+
+4. **Map Stage — Parallel Extraction Workers (`extract_trial`)**:
+   - Dynamic fan-out: each retrieved trial record is routed via LangGraph's `Send` API to its own isolated extraction worker.
+   - Workers run in parallel with constrained structured output schemas (`TrialRow`), extracting drug arms, comparators, mechanisms, and clinical outcomes independently.
+   - Context usage per worker is $O(1)$, completely eliminating prompt bloat and context window limits.
+
+5. **Reduce Stage — Evidence-Grounded Synthesis (`synthesize_table`)**:
+   - Runs once all parallel extraction workers merge into the state array.
+   - The synthesis LLM writes an executive briefing derived **strictly** from the verified extraction rows—never from raw uncontrolled text.
+   - Every claim is tied to primary record provenance chips (`[NCT...]`, `[PMCID...]`). Drug mechanisms are strictly locked to primary evidence, preventing parametric hallucination.
+
+6. **Streaming & Client Delivery**:
+   - Progress events and extraction milestones stream in real-time to the Next.js frontend over Server-Sent Events (SSE).
+   - TanStack Table renders the interactive, sortable, exportable matrix.
+
+### Core Entry Points & Interfaces
+
+- **Web UI (`http://localhost:3000`)**: Interactive Next.js 16 application featuring the Smart Table explorer, Indication Landscape matrix (mechanism × phase), and Catalyst & Readout Tracker timeline.
+- **REST & SSE Streaming API (`api.py` on port 8080/8000)**: FastAPI service exposing `/api/research`, `/api/research/stream`, `/api/landscape`, `/api/catalysts`, and export endpoints (`/api/export/excel`, `/api/export/pptx`).
+- **CLI Direct Execution**: Run the LangGraph agent directly from terminal:
+  ```bash
+  python research_agent.py --question "Compare Phase 3 oncology trials"
+  ```
+- **Claude MCP Server (`mcp_server.py`)**: Exposes all intelligence tools and research pipelines to Claude Desktop and Claude Code via Model Context Protocol.
+
 ## Key capabilities
 
 - **Federated retrieval RAG** across ClinicalTrials.gov, openFDA drug approvals, **FDA Complete Response Letters (rejection letters, full text, 2025+)**, PubMed Central full-text, SEC EDGAR 10-K/8-K filings, corporate press releases + earnings call transcripts, parsed conference-poster PDFs, **live FAERS adverse-event safety signals**, and **Orange/Purple Book patent-cliff data** — ten tools, one agent deciding which apply to a given question.
