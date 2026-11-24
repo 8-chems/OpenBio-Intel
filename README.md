@@ -106,6 +106,23 @@ flowchart TB
 
 **Why federate across six collections instead of one?** Different questions need different evidence. "What's Merck's stated pipeline strategy?" needs SEC filings, not trial registries. "What's the reported ORR for this combination?" needs conference-poster efficacy tables, not a registry's design summary. Each tool is scoped to what its corpus can actually answer, and the agent decides which to call — not a single undifferentiated blob of "everything."
 
+**What is Qdrant and why is it used?** Qdrant is an open-source, high-performance vector search engine written in Rust. While relational databases require exact keyword matches, Qdrant stores high-dimensional vector embeddings (1,536 dimensions) generated from clinical trial protocols, FDA records, and medical literature. By calculating geometric distance (cosine similarity), Qdrant retrieves trials discussing semantically identical concepts even when completely different medical jargon is used (e.g. matching "non-small cell lung cancer" with "NSCLC" or "pulmonary neoplasm"). In OpenBio-Intel, Qdrant executes server-side **Hybrid Search**: fusing dense semantic vectors with sparse BM25 token matching and deterministic metadata filtering (e.g. phase, completion year, trial status).
+
+**Why this specific reranker? (Xenova/ms-marco-MiniLM-L-6-v2):** Retrieval employs a two-stage retrieve-wide / rerank-narrow architecture ([`reranker.py`](reranker.py)):
+1. *Bi-encoders / RRF over-fetch candidates* (e.g., top 100) combining dense semantic search and BM25 keywords.
+2. *A cross-encoder re-scores each `(query, document)` pair simultaneously*, enabling deep cross-attention across tokens rather than evaluating query and document vectors independently.
+* **Model Choice**: `Xenova/ms-marco-MiniLM-L-6-v2` via the `fastembed` ONNX runtime was chosen over heavier models (such as `BAAI/bge-reranker-base`). In production benchmarks, MiniLM scores 100 pairs in **1.2s on CPU** compared to **10.1s for bge-reranker-base**. On a 1-vCPU container or ECS task, a heavier model would add 30–40s of latency per query—unacceptable for an interactive biopharma analyst workflow.
+* **Zero External Dependencies**: Runs 100% locally on CPU without external API calls or network egress, preserving data privacy.
+* **Pre-warmed Container**: Model weights (~80MB) are pre-baked into the Docker image (`Dockerfile.backend`) to eliminate cold-start download delays.
+* **Defensive Degradation**: Reranking is treated as an ordering refinement; if any exception occurs, the system safely falls back to reciprocal rank fusion (RRF) order rather than failing the request.
+
+**How jobs are organized in PostgreSQL (The Async Backbone):** Long-running agent workflows (30s to 3 minutes) decouple HTTP acceptance from graph execution using PostgreSQL ([`jobs.py`](jobs.py) and [`worker.py`](worker.py)) rather than introducing complex Redis/Celery infrastructure:
+- **`jobs` table**: Tracks each query (`id`, `type`, `payload`, `status: queued|running|done|failed`, `attempts`, `result`).
+- **`job_events` table**: Appends fine-grained execution events (`status`, `progress`, `result`, `error`).
+- **Atomic Concurrency with `SKIP LOCKED`**: Workers claim tasks via `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1`. Multiple background worker containers pull jobs simultaneously with zero locking conflicts or duplicate execution.
+- **Durable Event Replay**: Because progress events are stored as database rows rather than ephemeral pub/sub messages, a refreshed browser tab or dropped connection simply queries `events_since(last_id)` and replays the entire progress timeline with zero data loss.
+- **Crash Recovery & LangGraph Checkpointing**: A `reclaim_stale()` routine re-queues jobs if a worker dies mid-flight. Because graph execution is backed by LangGraph's Postgres checkpointer, restarted jobs resume directly from the last completed super-step rather than restarting from scratch and re-spending LLM tokens.
+
 ### End-to-End Query Lifecycle & Execution Flow
 
 When a user submits a query (e.g., *"Which Phase 3 trials use pembrolizumab, and what are they combining it with?"*), the pipeline executes across five distinct stages:
