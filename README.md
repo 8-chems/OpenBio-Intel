@@ -118,7 +118,8 @@ flowchart TB
 - **Watchlists with change detection** — watch a drug, company, trial, or topic; one check diffs ClinicalTrials.gov updates and new FDA rejection letters since the last run.
 - **Strict corpus grounding** — the synthesis prompt and schema forbid supplying a drug mechanism from the model's own knowledge. If a source record doesn't describe how a drug works, the row says so rather than filling the gap with a plausible-sounding fabrication.
 - **Automated executive exports** — one-click `.pptx` and `.xlsx` generation from whatever the analyst is already looking at, no re-running the agent.
-- **Provider-swappable LLM layer** — orchestration/routing runs on Anthropic, Kimi (Moonshot), or NVIDIA-hosted models via one `LLM_PROVIDER` switch; structured extraction cascades from gpt-4o-mini to gpt-4o with prompt-cache-friendly ordering (verified 2K+ cached tokens per extraction worker).
+- **Provider-swappable LLM layer** — orchestration and routing run on Anthropic Claude, Kimi (Moonshot), NVIDIA-hosted models, Groq, or custom OpenAI-compatible enterprise/academic gateways (e.g. Unistra, vLLM, Ollama) via one `LLM_PROVIDER` switch.
+- **Defensive fault tolerance & guardrails** — automatic Qdrant vector collection initialization, safe query fallbacks (`_safe_query_points`) on sparse secondary corpora, deterministic regex-assisted intent pre-screening to prevent false-negative refusals, and compressed tool payloads to avoid context overflow on broad searches.
 
 ## Use it from Claude (MCP)
 
@@ -139,23 +140,32 @@ Unlike API-wrapper servers that give agents raw per-call access to public endpoi
 
 ## 5-minute quickstart
 
-Requires [Docker](https://docs.docker.com/get-docker/) and Docker Compose, plus an [OpenAI API key](https://platform.openai.com/api-keys) (embeddings — required) and an [Anthropic API key](https://console.anthropic.com/) (agent orchestration — required unless you switch `LLM_PROVIDER`).
+Requires [Docker](https://docs.docker.com/get-docker/) and Docker Compose. You will also need an [OpenAI API key](https://platform.openai.com/api-keys) (for embeddings) and an [Anthropic API key](https://console.anthropic.com/) (agent orchestration), **OR** a custom OpenAI-compatible endpoint (like vLLM, Ollama, or an institutional gateway such as Unistra).
 
 ```bash
 git clone https://github.com/JAGAN666/OpenBio-Intel.git
 cd OpenBio-Intel
+
+# On Linux / macOS / Git Bash:
 ./quickstart.sh
+
+# On Windows (PowerShell):
+.\quickstart.ps1
 ```
 
-`quickstart.sh` will:
-1. Check for Docker and Docker Compose.
-2. Copy `.env.example` to `.env` if it doesn't exist yet (**you'll need to add your API keys before continuing** — the script pauses here).
-3. Build and start Qdrant, Neo4j, the FastAPI backend, and the Next.js frontend.
-4. Run a lightweight seed (50 clinical trials + 50 FDA approval records) so the UI is immediately interactive.
+The quickstart script will:
+1. Verify Docker and Docker Compose prerequisites.
+2. Copy `.env.example` to `.env` if not present (configure your API keys or `LLM_PROVIDER=custom`, then re-run).
+3. Build and launch the full stack: Qdrant, Neo4j, PostgreSQL, FastAPI backend, background worker, and Next.js frontend.
+4. Defensively initialize all 7 vector collections in Qdrant so auxiliary research tools (Landscape, Catalyst Tracker, PubMed, SEC filings) are ready without 404s.
+5. Ingest sample biopharma data (50 trials + 50 FDA approvals, plus active Phase 2/3 trials with future readouts for Catalyst Tracker).
 
-Once it finishes, open **http://localhost:3000** and try one of the example queries. The first Docker build compiles a knowledge-graph image with scispacy baked in and takes a few extra minutes — subsequent runs reuse the cached layers.
+Once complete, open **http://localhost:3000** to explore the UI.
+- Backend API docs: **http://127.0.0.1:8080/docs** (or port 8000)
+- Health check: **http://127.0.0.1:8080/api/health**
+- Logs: `docker compose logs -f backend worker`
 
-This lightweight seed is enough to explore the UI and prove the pipeline end-to-end, not a research-grade corpus. See [`seed_bulk_data.py`](seed_bulk_data.py) to ingest the full ClinicalTrials.gov + openFDA corpora (hundreds of thousands of records — expect this to run for hours and to incur real embedding API cost).
+This lightweight seed is enough to explore the UI and prove the pipeline end-to-end. See [`seed_bulk_data.py`](seed_bulk_data.py) to ingest the full ClinicalTrials.gov + openFDA corpora.
 
 ## Environment configuration
 
@@ -163,22 +173,28 @@ Every variable is documented inline in [`.env.example`](.env.example) — copy i
 
 | Variable | Required? | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | **Required** | Embeddings (`text-embedding-3-small`) for every retrieval path, and the pinned gpt-4o structured-extraction stage. |
-| `ANTHROPIC_API_KEY` | Required (default provider) | Agent orchestration/routing on Claude. Not needed if `LLM_PROVIDER` is set to `kimi` or `nvidia` instead. |
-| `LLM_PROVIDER` | Optional | `anthropic` (default), `kimi`, or `nvidia` — which provider handles orchestration/routing calls. |
+| `OPENAI_API_KEY` | **Required** (unless local embeddings) | Embeddings (`text-embedding-3-small`) for retrieval and extraction stages. |
+| `LLM_PROVIDER` | Optional | `anthropic` (default), `custom`, `kimi`, `nvidia`, or `groq`. |
+| `ANTHROPIC_API_KEY` | Required if `LLM_PROVIDER=anthropic` | Agent orchestration/routing on Claude. |
+| `CUSTOM_LLM_BASE_URL` | Required if `LLM_PROVIDER=custom` | Base URL for custom OpenAI-compatible gateway (e.g., `https://conversation.ia.unistra.fr/api/` or `http://localhost:11434/v1`). |
+| `CUSTOM_LLM_MODEL` | Required if `LLM_PROVIDER=custom` | Model name on the custom gateway (e.g., `mistral-small`, `llama3.3:70b`, `qwen2.5:32b`). |
+| `CUSTOM_LLM_API_KEY` | Optional | API token/bearer key for the custom gateway. |
+| `CUSTOM_MAX_TOKENS` | Optional | Completion token limit (defaults to `8192`). |
+| `REDUCER_CHAR_BUDGET` | Optional | Synthesis character budget for Map-Reduce aggregation (e.g. `35000`). |
 | `KIMI_API_KEY` | Optional | Only if `LLM_PROVIDER=kimi`. |
 | `NVIDIA_API_KEY` | Optional | Only if `LLM_PROVIDER=nvidia`, or for `evaluate_agent.py`'s judge model. |
+| `GROQ_API_KEY` | Optional | Only if `LLM_PROVIDER=groq`. |
 | `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | Optional | Knowledge-graph entity resolution. Defaults match Docker Compose's `neo4j` service. |
 | `LLAMA_CLOUD_API_KEY` | Optional | Only for PDF ingestion (`parse_pdfs.py`). |
 | `NCBI_API_KEY` / `NCBI_ENTREZ_EMAIL` | Optional | Only for PubMed ingestion (`fetch_pubmed.py`). |
-| `SEC_EDGAR_COMPANY` / `SEC_EDGAR_EMAIL` | Optional | Only for SEC filing ingestion (`fetch_sec_edgar.py`) — required by SEC EDGAR's own fair-access policy, not this project. |
-| `S3_BUCKET` / `AWS_DEFAULT_REGION` | Optional | Only if archiving raw ingestion payloads to S3 (`--skip-s3` avoids this entirely for local use). |
+| `SEC_EDGAR_COMPANY` / `SEC_EDGAR_EMAIL` | Optional | Only for SEC filing ingestion (`fetch_sec_edgar.py`). |
+| `S3_BUCKET` / `AWS_DEFAULT_REGION` | Optional | Only if archiving raw ingestion payloads to S3 (`--skip-s3` bypasses this for local dev). |
 
 ## Running the stack manually (without `quickstart.sh`)
 
 ```bash
-# 1. Qdrant + Neo4j
-docker compose up -d qdrant neo4j
+# 1. Start databases and services
+docker compose up -d postgres qdrant neo4j
 
 # 2. Python environment
 uv sync --locked          # creates .venv from the committed uv.lock (install uv: https://docs.astral.sh/uv/)
@@ -212,6 +228,7 @@ Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for develop
 ## Contributors
 
 - **JAGAN666** ([@JAGAN666](https://github.com/JAGAN666)) — creator & maintainer
+- **Chemseddine Berbague** ([@bchems](https://github.com/bchems)) — custom enterprise/academic LLM gateway support (`LLM_PROVIDER=custom`), defensive vector collection initialization & error-trapping (`_safe_query_points`), regex intent pre-screening guardrails, tool payload context-window optimization, and cross-platform quickstart automation (`quickstart.sh` & `quickstart.ps1`).
 
 Want to see your name here? Open a PR — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

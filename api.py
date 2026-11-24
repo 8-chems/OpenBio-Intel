@@ -69,7 +69,7 @@ from pydantic import BaseModel, Field
 
 from research_agent import (
     COLLECTION_NAME,
-    DEFAULT_MODEL,
+    DEFAULT_MODEL, CUSTOM_MODEL,
     CatalystTimeline,
     LandscapeMatrix,
     QDRANT_HOST,
@@ -175,7 +175,7 @@ def health() -> dict:
         "qdrant_ok": qdrant_ok,
         "collection": COLLECTION_NAME,
         "points": points,
-        "model": DEFAULT_MODEL,
+        "model": CUSTOM_MODEL,
         "anthropic_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
     }
 

@@ -50,3 +50,12 @@ click==8.4.2
 # daily-delta job must write bm25 vectors for new points or lexical search
 # coverage silently decays as the corpus grows past the one-time migration.
 fastembed>=0.8.0
+
+
+# Use Python 3.12 (3.13 gave you broken compiled wheels: pydantic_core, uuid_utils)
+langchain-core
+python-dateutil
+# optional
+# langchain-anthropic   # only for LLM_PROVIDER=anthropic
+# psycopg2-binary       # only if AACT_DB_URL is set
+ 

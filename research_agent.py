@@ -5,70 +5,42 @@ Map-Reduce extraction core so the graph fails closed instead of hallucinating,
 and scales to hundreds of retrieved documents without ever putting more than
 one trial's raw text in front of an LLM at a time:
 
-    START ─▶ [IntentClassifier] ──in domain?──▶ [OutOfDomain] ─▶ END
-                    │ yes                        deterministic refusal,
-                    ▼                             no LLM call, no Qdrant hit
-               [Agent] ──tool_calls?──▶ [Tool Node]
-                  │  no                      │
-                  │                          ├─ has_results? no ─▶ [NoResultsFallback] ─▶ END
-                  │                          │                     deterministic, no LLM call
-                  │                          │ yes
-                  │                          ▼
-                  │             continue_to_extraction (Mapper)
-                  │              Send("extract_trial", {"single_trial": t})
-                  │                  once per distinct retrieved trial
-                  │                          │
-                  │                          ▼
-                  │              [extract_trial] × N   (Map -- parallel workers,
-                  │               one LLM call per trial, .with_structured_output(TrialRow);
-                  │               writes merge via the operator.add reducer on extracted_rows)
-                  │                          │
-                  ▼                          ▼  (all N workers join)
-          [synthesize_table] ◀───────────────┘  (Reduce -- narrative written ONLY from the
-              │      ▲  loop back                extracted_rows array, never the raw
-       valid  │      │  retry (max 2)             Qdrant text)
-      output  │      └── on Pydantic ValidationError
-              ▼
+    START -> [IntentClassifier] --in domain?--> [OutOfDomain] -> END
+                    | yes                        deterministic refusal,
+                    v                             no LLM call, no Qdrant hit
+               [Agent] --tool_calls?--> [Tool Node]
+                  | no                      |
+                  |                          +- has_results? no -> [NoResultsFallback] -> END
+                  |                          | yes
+                  |                          v
+                  |                  prepare_extraction -> verify_candidates
+                  |                          |
+                  |             continue_to_extraction (Mapper)
+                  |              Send("extract_trial", {"single_trial": t})
+                  |                  once per distinct retrieved trial
+                  |                          |
+                  |                          v
+                  |              [extract_trial] x N   (Map, parallel workers,
+                  |               one LLM call per trial, structured output TrialRow;
+                  |               writes merge via the operator.add reducer)
+                  |                          |
+                  v                          v  (all N workers join)
+          [synthesize_table] <---------------+  (Reduce -- narrative written ONLY
+              |      ^  loop back                from the extracted_rows array)
+       valid  |      |  retry (max 2)
+      output  |      +-- on Pydantic ValidationError
+              v
              END
 
-  IntentClassifier   cheap/fast model gate: is this query in-domain at all?
-                      Runs BEFORE Qdrant is ever touched.
-  Agent               reasons about the question and chooses search arguments
-  Tool Node           runs the Qdrant hybrid search; flags whether anything
-                      it found is actually grounded in the query
-  NoResultsFallback   deterministic "nothing found" message -- bypasses
-                      extraction/synthesis entirely so the LLM never gets a
-                      chance to narrate around an empty result set
-  continue_to_extraction (Mapper)
-                      routes each distinct retrieved trial to its own
-                      extract_trial worker via the `Send` API -- the graph
-                      dynamically fans out to N parallel branches at runtime,
-                      N being however many trials Qdrant returned
-  extract_trial (Worker, Map stage)
-                      one independent LLM call per trial, constrained to the
-                      TrialRow schema; never sees any other trial's text, so
-                      context usage per worker is O(1), not O(all retrieved
-                      trials) the way one monolithic synthesis prompt was
-  synthesize_table (Reducer)
-                      runs once every worker has written into extracted_rows
-                      (merged via the operator.add state reducer -- parallel
-                      writes append instead of racing/overwriting each
-                      other), then writes narrative_summary from that
-                      structured array only; wrapped in the same Pydantic
-                      validate-or-retry loop (max 2 retries) as before
-
-The previous design ran an iterative ReACT loop (Tool Node could hand back to
-Agent for a refined second search) and asked ONE LLM call to both extract
-every trial's fields AND write the narrative in a single monolithic prompt --
-that is exactly what breaks down once retrieval returns hundreds of trials
-instead of a handful. This refactor keeps the guardrails (IntentClassifier,
-NoResultsFallback, the Pydantic retry loop) but replaces the "one giant
-synthesis prompt" step with the Map-Reduce fan-out above; Agent now runs
-exactly once per request instead of looping, since parallel extraction is
-what absorbs the work a second refinement search used to do.
+PROVIDER NOTE: the DEFAULT LLM provider is now the Unistra OpenAI-compatible
+gateway (LLM_PROVIDER=custom; see CUSTOM_* settings below). Every older
+provider (anthropic, groq, nvidia, kimi) is still selectable through
+LLM_PROVIDER. Embeddings are produced by embeddings.py (local fastembed by
+default, no API key) -- the Qdrant collections must be indexed with that
+same model.
 
     python research_agent.py
-    python research_agent.py --question "..." --model claude-opus-5
+    python research_agent.py --question "..."
 """
 
 from __future__ import annotations
@@ -108,103 +80,91 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 # --- Qdrant / embedding (must match fetch_and_embed_trials.py) --------------
 # Overridable via env: "localhost" is correct for bare-metal/host dev, but
-# inside a Docker Compose network "localhost" from the backend container
-# refers to the backend container itself, not the qdrant service -- Compose
-# sets QDRANT_HOST=qdrant so the container reaches Qdrant by service name.
+# inside a Docker Compose network the service name must be used instead.
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-# Overridable so a rebuilt collection (migrate_trials_v3.py) can be probed
-# before its alias is swapped; production leaves this at the alias name.
 COLLECTION_NAME = os.getenv("TRIALS_COLLECTION", "clinical_trials")
-# Federated second source (see ingest_pipeline.py): unstructured PDF
-# literature -- conference posters, FDA filings -- parsed via vision-based
-# extraction. Kept in its own collection rather than mixed into
-# COLLECTION_NAME because it has none of that collection's structured
-# fields (NCTId, Phase, LeadSponsorName); search_pdf_literature below is the
-# dedicated tool over it.
+# Federated second source: unstructured PDF literature (conference posters,
+# FDA filings). Own collection: no structured NCTId/Phase/Sponsor fields.
 COLLECTION_NAME_PDF = "clinical_trials_pdf_extracts"
-# Third federated source (see seed_bulk_data.py): openFDA's drug/drugsfda
-# bulk dataset -- FDA drug APPROVAL/APPLICATION records (application number,
-# sponsor, brand/generic names, dosage forms, RxNorm CUIs). Deliberately NOT
-# drug/event (adverse-event reports) -- that partition was never seeded into
-# this collection, so this tool cannot answer adverse-event/safety-signal
-# questions; see search_fda_records' own docstring for the exact scope.
+# Third source: openFDA drug/drugsfda approval/application records (NOT
+# adverse-event reports).
 COLLECTION_NAME_FDA = "openfda_drugsfda"
-# Fourth federated source (see fetch_pubmed.py): open-access PubMed Central
-# literature -- title/abstract/body text, chunked. Use it for scientific
-# efficacy/mechanism-of-action questions grounded in published research,
-# distinct from search_pdf_literature's conference-poster/FDA-filing corpus.
+# Fourth source: open-access PubMed Central literature, chunked.
 COLLECTION_NAME_PUBMED = "pubmed_literature"
-# Fifth federated source (see fetch_sec_edgar.py): SEC EDGAR 10-K/8-K
-# filings for major biopharma tickers, HTML-stripped and isolated to their
-# Pipeline/Clinical Trials/Research and Development sections. Use it for
-# corporate strategy, pipeline prioritization, and R&D investment questions
-# -- a fundamentally different lens than any trial/literature/FDA source,
-# since it reflects what the COMPANY says about its own strategy, not
-# third-party trial data or regulatory status.
+# Fifth source: SEC EDGAR 10-K/8-K pipeline / R&D sections.
 COLLECTION_NAME_SEC = "sec_filings"
 COLLECTION_NAME_CRL = "fda_crls"
-# Sixth federated source (see fetch_news_and_transcripts.py): real-time
-# corporate news -- RSS press releases (FDA, J&J, AbbVie -- Pfizer/Merck do
-# not have a usable public press-release RSS feed, verified live and
-# documented in that script) plus earnings call transcripts for all four
-# tracked tickers, keyword-isolated to pipeline/guidance/forward-looking
-# content. Distinct from SEC filings (formal, periodic, legally-reviewed
-# disclosure) -- this is unscripted management commentary and press-release
-# announcements, the fastest-moving/most real-time source in this system.
+# Sixth source: real-time corporate news (press-release RSS + earnings call
+# transcripts).
 COLLECTION_NAME_NEWS = "corporate_news"
-# EMBEDDING_MODEL is imported from embeddings.py (text-embedding-3-small,
-# 1536-dim, via OpenAI) -- must match the model the collections were indexed
-# with, or the query vector is not comparable to the stored vectors (and a
-# dimension mismatch hard-fails at the Qdrant call). All six collections
-# above are indexed with this SAME model, so one Qdrant client (see
-# _client()) can query any of them just by switching collection_name and
-# re-embedding the query text via embed_query().
+# All collections must be indexed with the SAME embedding model that
+# embeddings.embed_query() uses, or query vectors are not comparable.
 
 # --- Neo4j biomedical knowledge graph (see build_kg.py) ----------------------
-# Overridable via env: same QDRANT_HOST-style container override pattern --
-# "localhost" is correct for bare-metal/host dev; docker-compose.yml sets
-# NEO4J_URI=bolt://neo4j:7687 for the containerized backend.
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
 # --- LLM --------------------------------------------------------------------
-# claude-opus-5 is the current default Claude model. Note two API facts that
-# shape the request built below:
-#   * temperature / top_p / top_k are REJECTED with a 400 on this model.
-#   * thinking is ON by default, and max_tokens caps thinking + text together,
-#     so max_tokens needs real headroom or answers truncate mid-sentence.
+# DEFAULT_MODEL is only used by the legacy Anthropic provider branch.
 DEFAULT_MODEL = "claude-opus-5"
 MAX_TOKENS = 8000
 MAX_TOOL_ROUNDS = 3  # ReACT loop cap -- guards against a runaway agent
 MAX_SYNTHESIS_RETRIES = 2  # Pydantic self-correction budget
 
-# search_clinical_trials's own retrieval breadth -- this is what actually
-# bounds how many table_data rows a Smart Table query can ever produce (one
-# extract_trial Map worker per distinct trial retrieved, no separate cap
-# downstream in continue_to_extraction). Raised from a much smaller default
-# per explicit request for close to 50 rows back, then to 60 per a second
-# explicit request ("limit it to max 60 at least") after live testing
-# showed real run-to-run variance in how many rows a broad query actually
-# surfaces -- matches LANDSCAPE_TRIAL_LIMIT/CATALYST_TRIAL_LIMIT's precedent
-# for "broad, not exploratory" retrieval. The other five tools stay at
-# their own small per-call limit -- they feed supplementary evidence fused
-# into a trial's row, not additional rows of their own, so widening them
-# doesn't move the row count the user asked for.
-TRIAL_SEARCH_LIMIT = 60
-# Ceiling for the FINAL extraction/table pool -- distinct from
-# TRIAL_SEARCH_LIMIT (per-tool semantic breadth). Raised from the implicit
-# 60 because completeness is a product guarantee: an entity with 140 real
-# trials should show ~all of them. Above this ceiling the deterministic
-# analyst sort picks the subset and the TRUE total is surfaced in the
-# response (total_matching/shown/coverage_note).
-POOL_MAX_TRIALS = int(os.getenv("POOL_MAX_TRIALS", "150"))
+# --- Groq (legacy provider; every call goes through ChatOpenAI+base_url) -----
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_MAIN_MODEL = os.getenv("GROQ_MAIN_MODEL", "llama-3.3-70b-versatile")
+GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
+
+# --- Unistra gateway (DEFAULT provider; OpenAI-compatible) -------------------
+DEFAULT_PROVIDER = "custom"
+CUSTOM_BASE_URL = os.getenv("CUSTOM_LLM_BASE_URL", "https://conversation.ia.unistra.fr/api/")
+CUSTOM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY")
+# base_model_id from https://conversation.ia.unistra.fr/api/models
+CUSTOM_MODEL = os.getenv("CUSTOM_LLM_MODEL", "ministral")
+CUSTOM_MAX_TOKENS = int(os.getenv("CUSTOM_MAX_TOKENS", "8192"))
+# function_calling | json_schema | json_mode -- whichever test_llm_provider.py marks OK
+STRUCTURED_METHOD = os.getenv("STRUCTURED_METHOD", "function_calling")
+
+
+def _provider() -> str:
+    return os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER).lower()
+
+
+# One model for every tier unless CUSTOM_EXTRACTION_MODEL_MINI names a cheaper
+# one: with a single model a rejected "mini" result would just repeat the call.
+_CASCADE_ENABLED = (_provider() != "custom"
+                    or bool(os.getenv("CUSTOM_EXTRACTION_MODEL_MINI")))
+
+
+def _build_custom_llm(timeout: int, max_tokens: int | None = None,
+                      model_env_var: str | None = None, mini: bool = False):
+    """ChatOpenAI against the Unistra gateway. Per-feature overrides use a
+    CUSTOM_ prefix (CUSTOM_EXTRACTION_MODEL, CUSTOM_NARRATIVE_MODEL, ...) so
+    they never collide with the old Groq/OpenAI model ids."""
+    from langchain_openai import ChatOpenAI
+    if not CUSTOM_API_KEY:
+        raise SystemExit("[custom] CUSTOM_LLM_API_KEY is not set in .env")
+    model = ((os.getenv(f"CUSTOM_{model_env_var}") if model_env_var else None)
+             or CUSTOM_MODEL)
+    return ChatOpenAI(model=model, base_url=CUSTOM_BASE_URL, api_key=CUSTOM_API_KEY,
+                      temperature=0,
+                      max_tokens=min(max_tokens or CUSTOM_MAX_TOKENS, CUSTOM_MAX_TOKENS),
+                      timeout=timeout, max_retries=0)
+
+
+# search_clinical_trials's own retrieval breadth -- bounds how many table rows
+# a Smart Table query can produce (one extract_trial worker per distinct trial).
+TRIAL_SEARCH_LIMIT = int(os.getenv("TRIAL_SEARCH_LIMIT", "12"))
+# Ceiling for the FINAL extraction/table pool. Above this the deterministic
+# analyst sort picks the subset and the TRUE total is surfaced in the response.
+POOL_MAX_TRIALS = int(os.getenv("POOL_MAX_TRIALS", "20"))
 
 
 # =============================================================================
 # ENTITY EXACTNESS PRIMITIVES -- the "AABC must never match AABD" core.
-# Pure functions, unit-tested in eval/test_entity_matching.py.
 # =============================================================================
 def _norm_text(s: str) -> str:
     """Casefold and collapse every non-alphanumeric run to one space --
@@ -215,21 +175,11 @@ def _norm_text(s: str) -> str:
 def _alias_pattern(alias: str) -> "re.Pattern[str] | None":
     """Compile a token-boundary regex for one alias.
 
-    The load-bearing exactness primitive: alias tokens must appear in
-    order, separated by at most 3 non-alphanumeric characters, with NO
-    alphanumeric character butting up against either end. Consequences,
-    all covered by unit tests:
+    Alias tokens must appear in order, separated by at most 3 non-alphanumeric
+    characters, with NO alphanumeric character butting up against either end:
       - 'AABC' matches 'AABC' / 'aabc 200mg' but NEVER 'AABD' or 'AABCD'
-      - 'BMS 986278' == 'BMS-986278' == 'bms986278'? NO -- 'bms986278'
-        run-together has no boundary between tokens; we allow {0,3}
-        separators INCLUDING zero, so run-together DOES match. The
-        lookarounds only guard the outer edges.
-      - 'pembrolizumab' matches inside 'Pembrolizumab (MK-3475) 200mg'
-        (boundary before the strength), never inside 'pembrolizumab-like'?
-        '-like' is non-alphanumeric boundary then 'like' -- the lookahead
-        only forbids an IMMEDIATE alphanumeric, so 'pembrolizumabX' is
-        rejected but 'pembrolizumab-like' matches the alias token itself,
-        which is correct: that text IS about pembrolizumab.
+      - run-together 'bms986278' matches 'BMS 986278' (zero separators allowed)
+      - 'pembrolizumabX' is rejected, 'Pembrolizumab (MK-3475) 200mg' matches.
     """
     tokens = [re.escape(t) for t in _norm_text(alias).split()]
     if not tokens:
@@ -302,8 +252,7 @@ def _finalize_mechanism(row: "TrialRow", studied: list[str],
        'literature' claim must quote a span that occurs verbatim in the
        worker's sources, else it is downgraded to 'model_knowledge' (if a
        phrase was given) or 'unknown'.
-    3. 'model_knowledge' is refused for code-named agents (dev codes are
-       exactly where recall hallucinates).
+    3. 'model_knowledge' is refused for code-named agents.
     4. mechanism_described mirrors whether the provenance is verified.
     """
     parts: list[tuple[str, str, str, str]] = []  # (agent, phrase, source, evidence)
@@ -313,7 +262,6 @@ def _finalize_mechanism(row: "TrialRow", studied: list[str],
         f = drug_facts.get(name) or {}
         if f.get("mechanism"):
             kb_agents.append(name)
-            # Two dose arms of one drug resolve to one substance: one part.
             sub = (f.get("pref_name") or name).casefold()
             if sub in seen_substances:
                 continue
@@ -327,9 +275,6 @@ def _finalize_mechanism(row: "TrialRow", studied: list[str],
     if llm_source not in _MECH_SOURCE_RANK or llm_source == "kb":
         llm_source = "model_knowledge" if llm_phrase else "unknown"
     if llm_source in ("trial_text", "literature"):
-        # The quote must sit in the SOURCE the label claims -- a pool
-        # excerpt quote labelled 'trial_text' (or vice versa) is relabelled
-        # to where it was actually found; found nowhere, it downgrades.
         in_record = _evidence_in_source(llm_evidence, record_text)
         in_pools = _evidence_in_source(llm_evidence, pools_text)
         if in_record:
@@ -347,8 +292,6 @@ def _finalize_mechanism(row: "TrialRow", studied: list[str],
         llm_source, llm_evidence = "unknown", ""
 
     if llm_phrase and (uncovered or not parts):
-        # The model's phrase may already be per-agent ("a: X; b: Y"); keep
-        # it as one part attributed to the uncovered agents.
         parts.append((", ".join(uncovered) if len(uncovered) != 1 else uncovered[0],
                       llm_phrase, llm_source, llm_evidence))
 
@@ -361,18 +304,14 @@ def _finalize_mechanism(row: "TrialRow", studied: list[str],
         row.mechanism = parts[0][1]
     else:
         row.mechanism = "; ".join(f"{agent}: {phrase}" for agent, phrase, _, _ in parts)
-    covered_agents = len(kb_agents) + (1 if llm_phrase and uncovered else 0)
     weakest = max(parts, key=lambda p: _MECH_SOURCE_RANK[p[2]])[2]
     if uncovered and not llm_phrase and parts:
-        # KB knows some agents, nothing knows the rest: provenance is
-        # still honest for what is shown, but flag partial coverage.
         row.mechanism += f" (no mechanism on record for {', '.join(uncovered)})"
     row.mechanism_source = weakest
     row.mechanism_evidence = " | ".join(
         f"{agent}: {ev}" if len(parts) > 1 else ev
         for agent, _, _, ev in parts if ev)
     row.mechanism_described = weakest in _MECH_VERIFIED
-    _ = covered_agents
 
 
 def _propagate_mechanisms(rows: list["TrialRow"]) -> int:
@@ -717,13 +656,10 @@ def get_drug_mechanisms(names: list[str]) -> dict[str, dict]:
 def _expand_entity_aliases(name: str, kind: str = "drug") -> list[str]:
     """Alias set for an exact entity: the verbatim ask plus its RxNorm
     standard name and brand names (brand <-> generic bridging). Sibling
-    drug-node names are deliberately NOT collected -- verified live that
-    they drag in dosage-form garbage ("NM1F Injection") via loosely-mapped
-    concepts, and the boundary regex on the base name already matches
-    dose/strength variants. Fail-open to [name]: the guarantee degrades to
-    literal matching (honest small results), never to lookalikes.
-    Companies get no expansion (sponsor-boundary matching handles 'Merck'
-    inside 'Merck Sharp & Dohme LLC')."""
+    drug-node names are deliberately NOT collected (they drag in dosage-form
+    garbage via loosely-mapped concepts). Fail-open to [name]. Companies get
+    no expansion (sponsor-boundary matching handles 'Merck' inside 'Merck
+    Sharp & Dohme LLC')."""
     if kind != "drug":
         return [name]
     aliases = {name}
@@ -746,11 +682,9 @@ def _expand_entity_aliases(name: str, kind: str = "drug") -> list[str]:
             for r in rows:
                 # A concept only counts as THE asked entity when the ask
                 # equals (normalized) the drug-node name, the standard name,
-                # or a brand name. Substring drug-node hits are NOT enough:
-                # placebo-arm intervention names ("Placebo matching
-                # BMS-986278") become Drug nodes mapped to the RxNorm
-                # 'placebo' concept -- verified live to alias-poison the
-                # exact fetch into matching 9,707 trials.
+                # or a brand name. Substring drug-node hits are NOT enough
+                # (placebo-arm Drug nodes mapped to the RxNorm 'placebo'
+                # concept would alias-poison the exact fetch).
                 candidates = ([r["std"] or ""] + list(r["brands"] or []))
                 if (_norm_text(r["dname"] or "") != norm_ask
                         and all(_norm_text(c) != norm_ask for c in candidates)):
@@ -762,9 +696,9 @@ def _expand_entity_aliases(name: str, kind: str = "drug") -> list[str]:
     except Exception as exc:  # noqa: BLE001 -- fail open
         print(f"[entity] alias expansion unavailable for {name!r}: {exc}")
 
-    # RxNorm brand_names carry dosage-form artifacts ("Injection", "Pen")
-    # that as aliases would match essentially every trial. Drop generic /
-    # too-short aliases; the verbatim ask always survives.
+    # RxNorm brand_names carry dosage-form artifacts that as aliases would
+    # match essentially every trial. Drop generic / too-short aliases; the
+    # verbatim ask always survives.
     _GENERIC = {"injection", "tablet", "tablets", "capsule", "capsules",
                 "oral", "solution", "suspension", "syringe", "kit", "pen",
                 "vial", "cream", "spray", "patch", "gel", "powder",
@@ -812,12 +746,9 @@ def _entity_match_tier(patterns: list, trial: dict,
                        kind: str = "drug") -> str | None:
     """WHERE an asked entity appears in a trial, strongest tier first:
     'studied' (a studied intervention name), 'title', 'mentioned' (summary,
-    conditions, or sponsor text), or None. The distinction is the product
-    fix for "previously treated with pembrolizumab" trials passing as
-    pembrolizumab trials: a mention is evidence the drug is discussed, not
-    that it is investigated. Companies are checked against the sponsor
-    field only (a drug company being MENTIONED in another sponsor's summary
-    is not 'their trial')."""
+    conditions, or sponsor text), or None. A mention is evidence the drug is
+    discussed, not that it is investigated. Companies are checked against the
+    sponsor field only."""
     pats = [p for p in patterns if p is not None]
     if not pats:
         return None
@@ -845,8 +776,7 @@ def _entity_matches_trial(patterns: list, trial: dict,
                           kind: str = "drug", studied_only: bool = True) -> bool:
     """Does this trial verifiably INVESTIGATE any alias of the asked entity?
     With studied_only (the default), a hit only in the summary/conditions
-    ('mentioned' tier) is rejected -- the trial talks about the drug but
-    does not study it."""
+    ('mentioned' tier) is rejected."""
     tier = _entity_match_tier(patterns, trial, kind)
     if tier is None:
         return False
@@ -894,10 +824,8 @@ def _apply_query_constraints(trials: list[dict], constraints: dict | None
 
     Returns (kept, enforced, unenforceable): which constraint kinds were
     applied as hard filters, and which were asked but could not be checked
-    because the records carry no such field (reported honestly in the
-    coverage note rather than silently ignored). Indication, class/target,
-    setting and design are NOT enforced here -- their vocabulary varies
-    too much for regex; they go to the verifier stage.
+    because the records carry no such field. Indication, class/target,
+    setting and design are NOT enforced here -- they go to the verifier.
     """
     c = constraints or {}
     enforced: list[str] = []
@@ -945,6 +873,36 @@ def _apply_query_constraints(trials: list[dict], constraints: dict | None
             unenforceable.append("country")
 
     return kept, enforced, unenforceable
+
+
+def _is_obviously_clinical(question: str) -> bool:
+    """Cheap regex pre-screen: if the query contains obvious clinical-trial
+    keywords, skip the LLM intent classifier entirely.  This prevents small
+    models (e.g. ministral) from mis-classifying analytical / comparative
+    queries like 'Compare Phase 3 oncology trials' as out-of-domain."""
+    q = (question or "").lower()
+    # Any ONE of these tokens is enough to declare in-domain.
+    _CLINICAL_KEYWORDS = (
+        r"\btrial[s]?\b", r"\bclinical\b", r"\bphase\s*[1234ivIV]",
+        r"\boncology\b", r"\bcancer\b", r"\btumor\b", r"\btumour\b",
+        r"\bcarcinoma\b", r"\bneoplasm\b", r"\bmalignant\b",
+        r"\bleukemia\b", r"\bleukaemia\b", r"\blymphoma\b", r"\bmelanoma\b",
+        r"\bsarcoma\b", r"\bglioblastoma\b", r"\bmyeloma\b",
+        r"\bbreast\s+cancer\b", r"\blung\s+cancer\b", r"\bcolon\s+cancer\b",
+        r"\bovarian\s+cancer\b", r"\bprostate\s+cancer\b",
+        r"\bpharma\b", r"\bbiologic[s]?\b", r"\bbiosimilar\b",
+        r"\bdrug[s]?\b", r"\btherapy\b", r"\btherapeutic\b",
+        r"\bsponsor\b", r"\brecruiting\b", r"\benrolling\b",
+        r"\bfda\b", r"\bema\b", r"\bpipeline\b",
+        r"\bmechanism\b", r"\binhibitor\b", r"\bantibody\b", r"\bagonist\b",
+        r"\bantagonist\b", r"\bimmunotherapy\b", r"\bchemotherapy\b",
+        r"\bpembrolizumab\b", r"\bnivolumab\b", r"\bkeytruda\b",
+        r"\bindication\b", r"\bintervention\b", r"\bendpoint\b",
+        r"\befficacy\b", r"\bsafety\b", r"\bplacebo\b",
+        r"\brandomized\b", r"\bdouble.blind\b",
+        r"\bnct\d+\b",   # NCT IDs
+    )
+    return any(re.search(pat, q) for pat in _CLINICAL_KEYWORDS)
 
 
 def _regex_constraints(question: str) -> dict:
@@ -995,16 +953,15 @@ def _combination_required(question: str, constraints: dict | None,
     if (constraints or {}).get("combination_required"):
         return True
     return n_drug_entities >= 2 and bool(_COMBO_WORDS_RE.search(question or ""))
-# Pool-level relevance gate (see _deduped_pools): MiniLM cross-encoder
-# scores are strongly positive for on-topic pairs and negative for
-# unrelated ones -- 0.0 is a conservative "clearly irrelevant" cutoff.
+
+
+# Pool-level relevance gate: MiniLM cross-encoder scores are strongly
+# positive for on-topic pairs and negative for unrelated ones.
 _POOL_MIN_RERANK = 0.0
 _POOL_MIN_KEEP = 10
 
-# The intent gate deliberately uses a separate, cheap/fast model rather than
-# the generator -- it is a single-purpose yes/no classifier that runs on
-# every request BEFORE any Qdrant call, so its cost and latency matter more
-# than its depth. Same provider as the generator (no second API key to manage).
+# Cheap/fast intent gate model name (used by the legacy Anthropic provider
+# only; under LLM_PROVIDER=custom the single Unistra model is used).
 INTENT_MODEL = "claude-haiku-4-5"
 
 PHASE_LABELS = {
@@ -1017,11 +974,7 @@ PHASE_LABELS = {
 # STRUCTURED OUTPUT SCHEMA  ("Smart Table" contract for the frontend)
 # =============================================================================
 # These models ARE the API contract between the agent and the Next.js grid.
-# LangChain converts them to a tool schema, Anthropic constrains generation to
-# it, and the response is validated before it reaches our code -- so a
-# malformed row raises a ValidationError here rather than rendering an empty
-# cell in production. Field descriptions are sent to the model, so they are
-# prompt surface, not just documentation.
+# Field descriptions are sent to the model, so they are prompt surface.
 class TrialRow(BaseModel):
     """One row of the comparative trials grid."""
 
@@ -1104,10 +1057,7 @@ class TrialRow(BaseModel):
                     "is worse than a gap."
     )
     # Declared AFTER the prose deliberately: Pydantic field order is the JSON
-    # schema property order, which is generation order in the tool call. The
-    # model therefore writes what it found first, then flags what it just
-    # wrote -- a judgment over committed text rather than a prediction it has
-    # to live up to.
+    # schema property order, which is generation order in the tool call.
     mechanism_described: bool = Field(
         description="True ONLY if the retrieved text explicitly names the "
                     "mechanism of action or biological target of the primary "
@@ -1135,9 +1085,7 @@ class TrialRow(BaseModel):
 
 class ConstraintVerdict(BaseModel):
     """Why this row is in the table: one asked constraint, whether the
-    record satisfies it, and the evidence. 'deterministic' verdicts come
-    from structured fields (phase/status/sponsor/studied intervention);
-    'verified'/'not_stated' come from the per-candidate verifier."""
+    record satisfies it, and the evidence."""
 
     constraint: str = Field(description="e.g. 'phase: Phase 3', 'drug studied: pembrolizumab'")
     verdict: str = Field(description="satisfied | not_stated | violated")
@@ -1148,11 +1096,9 @@ class ConstraintVerdict(BaseModel):
 
 
 class SourceCitation(BaseModel):
-    """One clickable provenance link behind a Smart Table row -- the
-    auditability contract: every number an analyst sees should trace to a
-    primary document. The registry citation itself is added
-    DETERMINISTICALLY by extract_trial_node (never trusted to the LLM);
-    the model only cites the auxiliary evidence pools it actually fused."""
+    """One clickable provenance link behind a Smart Table row. The registry
+    citation itself is added DETERMINISTICALLY by extract_trial_node; the
+    model only cites the auxiliary evidence pools it actually fused."""
 
     source_type: str = Field(
         description="One of: registry, pdf_literature, fda, pubmed, sec, news."
@@ -1180,21 +1126,15 @@ class SmartTableResponse(BaseModel):
         description="One TrialRow for every distinct trial retrieved from the "
                     "database. This array backs the frontend data grid."
     )
-    # Completeness honesty fields -- set DETERMINISTICALLY in
-    # synthesize_table_node from prepare_extraction's verified counts, never
-    # by the LLM. Optional so cached results from older runs (fields absent)
-    # still validate and render unchanged.
+    # Completeness honesty fields -- set DETERMINISTICALLY, never by the LLM.
     total_matching: Optional[int] = Field(
         default=None,
         description="TRUE number of trials in the corpus verifiably matching "
-                    "the asked entity, when the query named one. May exceed "
-                    "len(table_data) when the corpus has more matches than "
-                    "the extraction ceiling."
+                    "the asked entity, when the query named one."
     )
     shown: Optional[int] = Field(
         default=None,
-        description="Number of rows actually shown (len(table_data)); paired "
-                    "with total_matching for the 'Showing X of Y' header."
+        description="Number of rows actually shown (len(table_data))."
     )
     coverage_note: Optional[str] = Field(
         default=None,
@@ -1205,11 +1145,8 @@ class SmartTableResponse(BaseModel):
 
 
 class NarrativeSummary(BaseModel):
-    """Reducer-stage output. Map-Reduce version of the old Synthesis contract:
-    table_data is already fixed by the time this runs -- deterministically
-    carried through from the Map stage's extracted_rows -- so the Reducer's
-    LLM call has one job left: write the prose, from the structured array
-    alone."""
+    """Reducer-stage output: table_data is already fixed by the Map stage,
+    so the Reducer's LLM call only writes the prose."""
 
     narrative_summary: str = Field(
         description="The high-level analytical answer to the user's question, "
@@ -1241,10 +1178,8 @@ class ExactEntity(BaseModel):
 class QueryConstraints(BaseModel):
     """Every STRUCTURED constraint the user stated, beyond named entities.
     Phase, status, sponsor, year and country are enforced as hard
-    deterministic filters over trial records; indication, class/target,
-    setting and design are verified per candidate by a later stage. Emit
-    ONLY what the user actually said -- an empty list means 'no
-    constraint', never a guess."""
+    deterministic filters; indication, class/target, setting and design are
+    verified per candidate. Emit ONLY what the user actually said."""
 
     phases: list[str] = Field(
         default_factory=list,
@@ -1333,9 +1268,7 @@ class IntentClassification(BaseModel):
 
 
 # --- deterministic guardrail messages ---------------------------------------
-# These are returned verbatim, with NO LLM call -- fixed strings, not prompts.
-# A refusal or a "nothing found" message is exactly the kind of output that
-# should never vary between two identical requests.
+# Returned verbatim, with NO LLM call.
 OUT_OF_DOMAIN_MESSAGE = (
     "I am a clinical intelligence agent and can only answer questions "
     "related to biopharma trials."
@@ -1370,30 +1303,14 @@ def _normalise_phase(raw: str | None) -> str | None:
 # =============================================================================
 # GROUNDING CHECK -- lexical overlap, deliberately NOT a cosine-score cutoff
 # =============================================================================
-# Empirically verified before writing this (see project notes): cosine
-# similarity in this embedding space CANNOT reliably separate a real drug
-# query from a fabricated one. A fictional drug embedded in authentic
-# trial-language phrasing can score HIGHER than a real, short drug-name-only
-# query -- e.g. "trials of XYZ-Fake-Drug-999 in oncology" scored 0.636, while
-# "brentuximab vedotin" (a real drug actually in the corpus) scored only
-# 0.555. Score magnitude tracks query phrasing style, not factual grounding.
-# A threshold strict enough to reject the fictional case would also reject
-# the real one -- i.e. it would break the AC-4 happy path to "fix" AC-3.
-#
-# The reliable signal instead: does the retrieved trial's OWN structured,
-# curated data (title / conditions / intervention names -- exact strings from
-# ClinicalTrials.gov, not a lossy vector) share any distinctive vocabulary
-# with the query? kNN search always returns the k *nearest* points, even when
-# nothing is actually relevant -- it has no notion of "nothing matches."
-# Lexical overlap against ground-truth fields does.
-# This list is bounded and domain-specific -- standard ClinicalTrials.gov
-# protocol/regulatory phrasing -- NOT an attempt at general-purpose stopwords.
-# It exists because a live run caught a real leak: the query "XYZ-Fake-Drug-999
-# investigational compound efficacy and safety" scored has_results=True purely
-# because a real trial's title happened to be "A Study to Evaluate the Safety
-# and Tolerability of...". "safety"/"efficacy"/"tolerability" are exactly the
-# kind of words that appear in nearly every trial's title regardless of what
-# drug is being studied, so they must never count as grounding evidence.
+# Cosine similarity in this embedding space CANNOT reliably separate a real
+# drug query from a fabricated one (score magnitude tracks query phrasing
+# style, not factual grounding). kNN search always returns the k *nearest*
+# points even when nothing is relevant. Lexical overlap against the trial's
+# own curated fields (title / conditions / intervention names) is the
+# reliable signal. The stopword list is bounded and domain-specific:
+# standard ClinicalTrials.gov protocol/regulatory phrasing, which appears in
+# nearly every trial title regardless of the drug studied.
 _STOPWORDS = {
     "trial", "trials", "clinical", "phase", "mechanism", "mechanisms",
     "oncology", "cancer", "drug", "drugs", "patient", "patients", "study",
@@ -1417,16 +1334,7 @@ _STOPWORDS = {
 }
 
 # Fraction of the corpus a token can appear in before it stops counting as
-# "distinctive" -- defense-in-depth ON TOP OF the stopword list above, not a
-# replacement for it. Measured directly against this corpus: at only 50
-# trials, common regulatory words like "safety" (6%) and "study" (26%) don't
-# YET have enough repetition to statistically separate from real, notable
-# drug names like pembrolizumab (16%) -- so a threshold has to sit safely
-# above that to avoid excluding legitimately common real drugs today. This
-# becomes the primary defense once the corpus is large enough for boilerplate
-# title templates ("A Study to Evaluate the Safety and Efficacy of...") to
-# dominate their true frequency; the static list is what does the real work
-# at today's scale.
+# "distinctive" -- defense-in-depth on top of the stopword list.
 _MAX_CORPUS_FREQUENCY = 0.30
 
 _corpus_doc_freq: dict[str, int] | None = None
@@ -1434,9 +1342,7 @@ _corpus_size: int = 0
 
 
 def _corpus_frequencies() -> tuple[dict[str, int], int]:
-    """Lazily computed, cached for the process lifetime -- the collection
-    doesn't change mid-run, and re-scrolling it on every tool call would be
-    wasteful."""
+    """Lazily computed, cached for the process lifetime."""
     global _corpus_doc_freq, _corpus_size
     if _corpus_doc_freq is None:
         df: dict[str, int] = {}
@@ -1467,8 +1373,7 @@ def _is_grounded(query: str, trials: list[dict]) -> bool:
     qtok = _content_tokens(query)
     if not qtok:
         # No distinctive tokens to check (a very generic query) -- don't
-        # block on a signal we can't compute here; the citation contract in
-        # Synthesis is the backstop for that case.
+        # block on a signal we can't compute here.
         return True
     for t in trials:
         haystack = " ".join([
@@ -1482,22 +1387,9 @@ def _is_grounded(query: str, trials: list[dict]) -> bool:
 
 
 def _is_grounded_literature(query: str, chunks: list[dict]) -> bool:
-    """Same anti-hallucination principle as _is_grounded (kNN always returns
-    the k nearest points regardless of true relevance), applied to the PDF
-    literature collection instead of the trials registry.
-
-    Reuses _content_tokens for the QUERY side only -- its stopword list and
-    document-frequency filtering are computed against COLLECTION_NAME's
-    vocabulary, which is a reasonable proxy for stripping trivial life-
-    sciences boilerplate out of a query regardless of which collection that
-    query is then checked against. The HAYSTACK side (each chunk's raw Text)
-    is checked with plain token containment rather than curated structured
-    fields, because COLLECTION_NAME_PDF has no equivalent to
-    BriefTitle/conditions/interventions -- and is far too small today for
-    its own document-frequency stats to be meaningful. Worth adding a
-    PDF-corpus-specific _MAX_CORPUS_FREQUENCY-style filter once that
-    collection holds more than a handful of documents.
-    """
+    """Same anti-hallucination principle as _is_grounded, applied to the PDF
+    literature collection: query-side tokens via _content_tokens, haystack
+    is each chunk's raw Text."""
     qtok = _content_tokens(query)
     if not qtok:
         return True
@@ -1509,15 +1401,8 @@ def _is_grounded_literature(query: str, chunks: list[dict]) -> bool:
 
 
 def _is_grounded_fda(query: str, records: list[dict]) -> bool:
-    """Same anti-hallucination principle as _is_grounded, applied to the
-    openFDA drugsfda collection: does anything actually retrieved share real
-    vocabulary with the query, since kNN always returns its k nearest points
-    regardless of true relevance.
-
-    Haystack is BrandNames + ActiveIngredients + SponsorName -- the FDA
-    record's own curated identity fields, same role BriefTitle/conditions/
-    interventions play for _is_grounded.
-    """
+    """Grounding for the openFDA drugsfda collection. Haystack is
+    BrandNames + ActiveIngredients + SponsorName."""
     qtok = _content_tokens(query)
     if not qtok:
         return True
@@ -1533,16 +1418,7 @@ def _is_grounded_fda(query: str, records: list[dict]) -> bool:
 
 
 def _is_grounded_pubmed(query: str, chunks: list[dict]) -> bool:
-    """Same anti-hallucination principle as _is_grounded, applied to the
-    PubMed Central literature collection: does anything actually retrieved
-    share real vocabulary with the query.
-
-    Haystack is Title + Journal + the chunk's own Text -- there is no
-    curated identity field set here the way BriefTitle/conditions/
-    interventions serve _is_grounded, so the chunk's own indexed text (which
-    already leads with "Title: ...\\nJournal: ..." per fetch_pubmed.py's
-    build_chunks()) is the closest equivalent.
-    """
+    """Grounding for PubMed Central. Haystack is Title + Journal + Text."""
     qtok = _content_tokens(query)
     if not qtok:
         return True
@@ -1556,14 +1432,7 @@ def _is_grounded_pubmed(query: str, chunks: list[dict]) -> bool:
 
 
 def _is_grounded_sec(query: str, chunks: list[dict]) -> bool:
-    """Same anti-hallucination principle as _is_grounded, applied to the SEC
-    EDGAR filings collection: does anything actually retrieved share real
-    vocabulary with the query.
-
-    Haystack is Company + Ticker + the chunk's own Text -- the closest
-    equivalent here to BriefTitle/conditions/interventions, since a filing
-    excerpt has no other curated identity fields.
-    """
+    """Grounding for SEC filings. Haystack is Company + Ticker + Text."""
     qtok = _content_tokens(query)
     if not qtok:
         return True
@@ -1577,9 +1446,8 @@ def _is_grounded_sec(query: str, chunks: list[dict]) -> bool:
 
 
 def _is_grounded_crl(query: str, chunks: list[dict]) -> bool:
-    """Anti-hallucination gate for the CRL collection -- same principle as
-    _is_grounded_sec: something retrieved must share real vocabulary with
-    the query. Haystack is CompanyName + application numbers + chunk Text."""
+    """Grounding for the CRL collection. Haystack is CompanyName +
+    application numbers + chunk Text."""
     qtok = _content_tokens(query)
     if not qtok:
         return True
@@ -1595,15 +1463,8 @@ def _is_grounded_crl(query: str, chunks: list[dict]) -> bool:
 
 
 def _is_grounded_news(query: str, chunks: list[dict]) -> bool:
-    """Same anti-hallucination principle as _is_grounded, applied to the
-    corporate news collection: does anything actually retrieved share real
-    vocabulary with the query.
-
-    Haystack differs by SourceType -- a press release chunk's identity
-    fields are Title/FeedName, a transcript chunk's are Company/Ticker --
-    so both are included; whichever apply to a given result contribute,
-    the other simply contributes empty strings.
-    """
+    """Grounding for corporate news. Press-release chunks carry
+    Title/FeedName, transcript chunks carry Company/Ticker -- both included."""
     qtok = _content_tokens(query)
     if not qtok:
         return True
@@ -1624,19 +1485,8 @@ _qdrant: QdrantClient | None = None
 
 
 def _client() -> QdrantClient:
-    """Lazy singleton -- a plain client now; embedding happens explicitly via
-    embeddings.embed_query() before each search, not via a bound FastEmbed
-    model.
-
-    timeout=30, not the default (None, which falls through to httpx's own
-    ~5s default) -- verified live against the AWS deployment: a payload-
-    filtered query (e.g. catalyst retrieval's phase_filter) against the
-    597K-point clinical_trials collection can genuinely take several
-    seconds longer than that, and a real "timed out" 502 was reproduced
-    end-to-end this way even though the query itself was actively
-    succeeding server-side (confirmed via Qdrant's own access log), just
-    not within httpx's default window.
-    """
+    """Lazy singleton. timeout=30: a payload-filtered query against a large
+    collection can take several seconds longer than httpx's ~5s default."""
     global _qdrant
     if _qdrant is None:
         _qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
@@ -1646,18 +1496,25 @@ def _client() -> QdrantClient:
 # Collections confirmed (at first use, cached) to carry the bm25 sparse
 # vector -- hybrid fusion is attempted once per collection and downgraded
 # to dense-only permanently for that process if the collection predates the
-# hybrid migration (as the AWS deployment does until its snapshot is
-# recovered). Keyed by collection name; values: True (hybrid), False
-# (dense-only fallback).
+# hybrid migration.
 _hybrid_capable: dict[str, bool] = {}
+
+
+def _safe_query_points(collection_name: str, **kwargs) -> list:
+    """Safe wrapper around query_points that returns an empty list if collection is missing."""
+    try:
+        return _client().query_points(collection_name=collection_name, **kwargs).points
+    except Exception as exc:
+        if "doesn't exist" in str(exc) or "Not found" in str(exc) or "404" in str(exc):
+            return []
+        raise
 
 
 def _query_hybrid(collection: str, query: str, query_filter, limit: int):
     """Dense+BM25 RRF fusion via Qdrant's Query API, with a one-time
     per-collection fallback to dense-only when the collection has no bm25
     sparse vector. Both prefetch branches over-fetch 3x so RRF has real
-    candidate diversity to fuse rather than two near-identical top-k lists.
-    """
+    candidate diversity to fuse."""
     dense = embed_query(query)
     if _hybrid_capable.get(collection, True):
         try:
@@ -1677,18 +1534,25 @@ def _query_hybrid(collection: str, query: str, query_filter, limit: int):
             _hybrid_capable[collection] = True
             return hits
         except Exception as exc:  # noqa: BLE001
+            if "doesn't exist" in str(exc) or "Not found" in str(exc) or "404" in str(exc):
+                return []
             if "Not existing vector name" not in str(exc):
                 raise
             print(f"[retrieval] {collection}: no bm25 sparse vector -- "
                   f"dense-only fallback for this process")
             _hybrid_capable[collection] = False
 
-    return _client().query_points(
-        collection_name=collection,
-        query=dense,
-        query_filter=query_filter,
-        limit=limit,
-    ).points
+    try:
+        return _client().query_points(
+            collection_name=collection,
+            query=dense,
+            query_filter=query_filter,
+            limit=limit,
+        ).points
+    except Exception as exc:
+        if "doesn't exist" in str(exc) or "Not found" in str(exc) or "404" in str(exc):
+            return []
+        raise
 
 
 def retrieve_trials(
@@ -1698,16 +1562,11 @@ def retrieve_trials(
     collection: Optional[str] = None,
 ) -> list[dict]:
     """The raw clinical-trials retrieval core -- embed, query Qdrant (hybrid
-    dense+BM25 RRF where the collection supports it), shape payloads into
-    plain dicts. Extracted from the search_clinical_trials tool so the eval
-    harness (eval/test_retrieval.py) measures EXACTLY the retrieval path the
-    agent uses -- when this function changes (hybrid fusion, reranking), the
-    tool and the eval numbers change together, which is the whole point of
-    having a baseline.
+    dense+BM25 RRF where supported), rerank, shape payloads into plain
+    dicts. Shared with the eval harness so both measure the same path.
 
-    Raises on failure -- the tool wrapper is what converts errors into
-    agent-visible observations; the eval harness wants a loud failure.
-    """
+    Raises on failure -- the tool wrapper converts errors into
+    agent-visible observations."""
     query_filter = None
     if phase:
         query_filter = qmodels.Filter(
@@ -1716,9 +1575,7 @@ def retrieve_trials(
             )]
         )
 
-    # Over-fetch for the cross-encoder when reranking is on -- it re-scores
-    # a wide fused candidate pool and keeps the true top `limit` (see
-    # reranker.py). With reranking off, fetch exactly `limit` as before.
+    # Over-fetch for the cross-encoder when reranking is on.
     import reranker as _rr
     fetch_n = max(limit, _rr.RERANK_CANDIDATES) if _rr.enabled() else limit
     hits = _query_hybrid(collection or COLLECTION_NAME, query, query_filter, fetch_n)
@@ -1764,19 +1621,40 @@ def search_clinical_trials(query: str, phase_filter: Optional[str] = None) -> st
     except Exception as exc:  # surfaced to the agent as an observation
         return json.dumps({"error": f"Qdrant search failed: {exc}", "has_results": False})
 
-    # has_results is NOT `len(results) > 0` -- Qdrant's kNN search always
-    # returns up to `limit` nearest points, even for a query about something
-    # that doesn't exist in the corpus. It is the lexical-grounding check
-    # above: does anything actually retrieved share real vocabulary with what
-    # was asked. See the _is_grounded docstring for the empirical case against
-    # using a cosine-score cutoff instead.
+    # has_results is NOT `len(results) > 0` -- kNN always returns up to
+    # `limit` nearest points. It is the lexical-grounding check.
     grounded = _is_grounded(query, results)
 
-    return json.dumps(
+    # Slim the tool result for the agent's context window: the agent only
+    # needs enough to decide whether to proceed — the full records are
+    # stored in state["retrieved_trials"] for the extraction pipeline.
+    # With ministral (32K context), full JSON of 12 trials overflows.
+    _AGENT_TOOL_CHAR_BUDGET = int(os.getenv("AGENT_TOOL_CHAR_BUDGET", "12000"))
+    slim_trials = []
+    for t in results:
+        slim = {
+            "NCTId": t.get("NCTId"),
+            "BriefTitle": t.get("BriefTitle"),
+            "Phase": t.get("Phase"),
+            "OverallStatus": t.get("OverallStatus"),
+            "LeadSponsorName": t.get("LeadSponsorName"),
+            "conditions": t.get("conditions"),
+            "interventions": [
+                (iv.get("name") if isinstance(iv, dict) else iv)
+                for iv in (t.get("interventions") or [])
+            ],
+        }
+        slim_trials.append(slim)
+
+    payload = json.dumps(
         {"query": query, "phase_filter": phase, "returned": len(results),
-         "has_results": grounded, "trials": results},
+         "has_results": grounded, "trials": slim_trials},
         indent=2,
     )
+    # Hard truncation safety net — never blow the context window.
+    if len(payload) > _AGENT_TOOL_CHAR_BUDGET:
+        payload = payload[:_AGENT_TOOL_CHAR_BUDGET] + "\n... (truncated)"
+    return payload
 
 
 @tool
@@ -1819,8 +1697,6 @@ def search_pdf_literature(query: str) -> str:
             "Text": meta.get("Text") or "",
         })
 
-    # Same kNN-always-returns-something caveat as search_clinical_trials --
-    # see _is_grounded_literature.
     grounded = _is_grounded_literature(query, results)
 
     return json.dumps(
@@ -1832,8 +1708,7 @@ def search_pdf_literature(query: str) -> str:
 
 @tool
 def search_fda_records(query: str) -> str:
-    """Search FDA drug approval/application records (openFDA drug/drugsfda),
-    embedded with the same OpenAI model as the other two collections.
+    """Search FDA drug approval/application records (openFDA drug/drugsfda).
 
     Use this for FDA REGULATORY/APPROVAL facts: whether a drug has an FDA
     application on file, its application number, the sponsor of record,
@@ -1879,8 +1754,6 @@ def search_fda_records(query: str) -> str:
             "SourceURL": meta.get("SourceURL"),
         })
 
-    # Same kNN-always-returns-something caveat as the other two tools -- see
-    # _is_grounded_fda.
     grounded = _is_grounded_fda(query, results)
 
     return json.dumps(
@@ -1893,8 +1766,7 @@ def search_fda_records(query: str) -> str:
 @tool
 def search_pubmed_literature(query: str) -> str:
     """Search open-access PubMed Central scientific literature (title,
-    abstract, and body text of recent biopharma/oncology papers), embedded
-    with the same OpenAI model as the other collections.
+    abstract, and body text of recent biopharma/oncology papers).
 
     Use this for SCIENTIFIC EFFICACY and MECHANISM-of-action questions
     grounded in published research: how a drug or drug class works, what a
@@ -1931,8 +1803,6 @@ def search_pubmed_literature(query: str) -> str:
             "SourceURL": meta.get("SourceURL"),
         })
 
-    # Same kNN-always-returns-something caveat as the other Qdrant tools --
-    # see _is_grounded_pubmed.
     grounded = _is_grounded_pubmed(query, results)
 
     return json.dumps(
@@ -1946,8 +1816,7 @@ def search_pubmed_literature(query: str) -> str:
 def search_sec_filings(query: str) -> str:
     """Search SEC EDGAR 10-K/8-K filings for major biopharma tickers (PFE,
     MRK, JNJ, ABBV), isolated to their Pipeline/Clinical Trials/Research and
-    Development sections and embedded with the same OpenAI model as the
-    other collections.
+    Development sections.
 
     Use this for CORPORATE STRATEGY and PIPELINE PRIORITIZATION questions:
     what a company itself states about its R&D pipeline, which programs it
@@ -1993,8 +1862,6 @@ def search_sec_filings(query: str) -> str:
             "SourceURL": meta.get("SourceURL"),
         })
 
-    # Same kNN-always-returns-something caveat as the other Qdrant tools --
-    # see _is_grounded_sec.
     grounded = _is_grounded_sec(query, results)
 
     return json.dumps(
@@ -2009,8 +1876,7 @@ def search_corporate_news(query: str) -> str:
     """Search real-time corporate news: RSS press releases (FDA regulatory
     announcements, Johnson & Johnson, and AbbVie corporate newsrooms) and
     earnings call transcripts (all four tracked tickers -- PFE, MRK, JNJ,
-    ABBV -- keyword-isolated to pipeline/guidance/forward-looking content),
-    embedded with the same OpenAI model as the other collections.
+    ABBV -- keyword-isolated to pipeline/guidance/forward-looking content).
 
     Use this for the MOST REAL-TIME layer of intelligence available: recent
     regulatory press announcements, corporate press releases, and
@@ -2024,8 +1890,7 @@ def search_corporate_news(query: str) -> str:
     language) that a 10-K/8-K would not.
 
     SCOPE NOTE: Pfizer and Merck do NOT have a usable public press-release
-    RSS feed (verified live -- see fetch_news_and_transcripts.py's module
-    docstring), so press-release-type results here skew toward FDA/J&J/
+    RSS feed, so press-release-type results here skew toward FDA/J&J/
     AbbVie; Pfizer and Merck ARE covered for the earnings-transcript half
     of this corpus. If asked about a Pfizer or Merck press release
     specifically and nothing relevant is retrieved, say so rather than
@@ -2064,8 +1929,6 @@ def search_corporate_news(query: str) -> str:
             "SourceURL": meta.get("SourceURL"),
         })
 
-    # Same kNN-always-returns-something caveat as the other Qdrant tools --
-    # see _is_grounded_news.
     grounded = _is_grounded_news(query, results)
 
     return json.dumps(
@@ -2132,17 +1995,12 @@ def search_fda_crls(query: str) -> str:
 # TOOL -- AACT text-to-SQL: exact aggregates over ALL of ClinicalTrials.gov
 # =============================================================================
 # CTTI's AACT is a free, nightly-refreshed PostgreSQL mirror of the entire
-# ClinicalTrials.gov registry (70+ normalized tables). Vector search is the
-# wrong tool for counting/aggregation questions ("how many Phase 3 obesity
-# trials did Novo start in 2025?") -- SQL over AACT answers them EXACTLY.
-# Requires a free account at https://aact.ctti-clinicaltrials.org/ -- set
+# ClinicalTrials.gov registry. Requires a free account at
+# https://aact.ctti-clinicaltrials.org/ -- set
 # AACT_DB_URL=postgresql://user:pass@aact-db.ctti-clinicaltrials.org:5432/aact
 # The tool is only registered in TOOLS when that env var is present.
 AACT_DB_URL = os.getenv("AACT_DB_URL", "")
 
-# The subset of AACT's schema the SQL generator is told about -- enough for
-# the aggregate questions this tool exists for, small enough to keep the
-# generation prompt reliable.
 _AACT_SCHEMA_CARD = """
 studies(nct_id, brief_title, overall_status, phase, study_type,
         enrollment, start_date, primary_completion_date, completion_date,
@@ -2211,8 +2069,9 @@ def query_trial_statistics(question: str) -> str:
                                     "free registration at aact.ctti-clinicaltrials.org)",
                            "has_results": False})
     try:
+        # SQL generation uses the main-tier model (schema-faithful SQL).
         sql_llm = _build_gpt4o_llm(30, model_env_var="AACT_SQL_MODEL",
-                                   default_model="gpt-4o-mini")
+                                   default_model="gpt-4o")
         gen = sql_llm.invoke([
             SystemMessage(content=(
                 "Write ONE PostgreSQL SELECT statement (no semicolon, no "
@@ -2319,9 +2178,7 @@ def get_exclusivity(drug_name: str) -> str:
 # =============================================================================
 FAERS_API = "https://api.fda.gov/drug/event.json"
 # FAERS reporting artifacts that dominate every drug's top-reactions list
-# without carrying a differential safety signal -- filtered from the ranked
-# list so the LLM sees actual clinical reactions. (They still participate
-# in ROR math when explicitly asked about.)
+# without carrying a differential safety signal.
 _FAERS_NOISE = {"OFF LABEL USE", "DRUG INEFFECTIVE", "PRODUCT DOSE OMISSION ISSUE",
                 "DEATH", "MALIGNANT NEOPLASM PROGRESSION", "DISEASE PROGRESSION"}
 
@@ -2379,6 +2236,7 @@ def get_safety_signals(drug_name: str, reaction: Optional[str] = None) -> str:
                                "note": "No FAERS reports mention this drug name."})
         overall = _faers_total({"search": "receivedate:[19000101 TO 20991231]"})
 
+        counts: dict = {}
         if reaction:
             terms = [reaction.upper()]
         else:
@@ -2411,7 +2269,7 @@ def get_safety_signals(drug_name: str, reaction: Optional[str] = None) -> str:
             "interpretation": "ROR>1 with ci95_low>1 and >=3 reports is a "
                               "disproportionality signal (association, not "
                               "causation). Source: openFDA drug/event API.",
-            "source_url": f"https://open.fda.gov/apis/drug/event/",
+            "source_url": "https://open.fda.gov/apis/drug/event/",
         }, indent=2)
     except Exception as exc:  # surfaced to the agent as an observation
         return json.dumps({"error": f"FAERS query failed: {exc}",
@@ -2421,7 +2279,7 @@ def get_safety_signals(drug_name: str, reaction: Optional[str] = None) -> str:
 # =============================================================================
 # TOOL -- knowledge graph (Neo4j): exact entity resolution, not vector search
 # =============================================================================
-_neo4j_driver: GraphDatabase.driver | None = None
+_neo4j_driver = None
 
 
 def _graph_client():
@@ -2432,15 +2290,11 @@ def _graph_client():
 
 
 # Matches on three independent signals, any one of which is sufficient:
-#   1. d.name CONTAINS entity      -- the raw drug name AS WRITTEN in a trial
+#   1. d.name matches the entity (boundary regex) -- raw name as in a trial
 #   2. c.standard_name = entity    -- the RxNorm generic/canonical name
-#   3. entity IN c.brand_names     -- an official RxNorm trade name (built at
-#                                      ingestion time via the free NIH RxNav
-#                                      API -- see build_kg.py) -- this is
-#                                      what resolves "Keytruda" -> the SAME
-#                                      Concept node "pembrolizumab" is
-#                                      attached to, in ONE Cypher query, no
-#                                      live external API call needed here.
+#   3. entity IN c.brand_names     -- an official RxNorm trade name, which
+#      resolves "Keytruda" -> the SAME Concept node "pembrolizumab" is
+#      attached to, in ONE Cypher query.
 _KG_TRIAL_RETURN = """
 RETURN t.id AS NCTId, t.title AS BriefTitle, t.phase AS Phase,
        t.status AS OverallStatus, t.sponsor AS LeadSponsorName,
@@ -2456,6 +2310,9 @@ RETURN t.id AS NCTId, t.title AS BriefTitle, t.phase AS Phase,
 """
 
 
+# ORDERING IS A RELEVANCE DECISION: live-status trials first, then newest
+# registrations first (NCT ids are chronological). An analyst asking about a
+# drug wants the CURRENT pipeline, not the oldest 60 trials.
 KG_MATCH_QUERY = """
 MATCH (t:Trial)-[i:INVESTIGATES]->(d:Drug)
 WHERE coalesce(i.role, 'studied') = 'studied'
@@ -2474,13 +2331,9 @@ ORDER BY
 LIMIT $limit
 """
 # Exact-fetch queries (fetch_trials_exact): alias-set variants of the KG
-# match, used by the completeness backfill. $aliases is the full alias
-# list for concept-name equality; $pattern is the boundary regex over the
-# same aliases for Drug-node names.
-# `i.role` is written by the v3 migration: only edges whose role is
-# 'studied' (or unset, on pre-migration graphs) count -- a placebo-arm
-# Drug node ("Placebo matching X") or an active-comparator arm is not a
-# trial OF that drug.
+# match, used by the completeness backfill. `i.role` is written by the v3
+# migration: only edges whose role is 'studied' (or unset, on pre-migration
+# graphs) count.
 EXACT_DRUG_QUERY = """
 MATCH (t:Trial)-[i:INVESTIGATES]->(d:Drug)
 WHERE coalesce(i.role, 'studied') = 'studied'
@@ -2513,12 +2366,10 @@ LIMIT $limit
 
 
 # Text caps for the trial dict that travels through state into every
-# extraction worker's prompt -- generous enough to carry mechanism text
-# (intervention descriptions, detailed description) and the eligibility
-# block the verifier needs, bounded so a 150-row fanout stays affordable.
-_SUMMARY_CAP = 1200
-_DETAILED_CAP = 1800
-_ELIGIBILITY_CAP = 1200
+# extraction worker's prompt.
+_SUMMARY_CAP = int(os.getenv("TRIAL_SUMMARY_CAP", "800"))
+_DETAILED_CAP = int(os.getenv("TRIAL_DETAILED_CAP", "1000"))
+_ELIGIBILITY_CAP = int(os.getenv("TRIAL_ELIGIBILITY_CAP", "800"))
 # v3 payload keys copied verbatim onto the trial dict (missing on
 # pre-migration points -- every consumer .get()s them).
 _TRIAL_V3_KEYS = ("OfficialTitle", "Acronym", "collaborators", "keywords",
@@ -2554,8 +2405,6 @@ def _trial_from_payload(pl: dict, source: str | None = None,
     return t
 
 
-
-
 def _neo4j_row_to_trial(r, source: str = "exact_match") -> dict:
     def _load(key):
         try:
@@ -2577,9 +2426,9 @@ VERIFIER_BATCH = 8
 CORRECTIVE_MIN_ROWS = 5
 MINI_ATTEMPTS = 6
 # Reducer prompt budget for the rows array (~chars; ≈ tokens * 4). Keeps
-# the single Reduce request under gpt-4o's 30K-TPM ceiling with headroom
-# for the system prompt and the question.
-REDUCER_CHAR_BUDGET = int(os.getenv("REDUCER_CHAR_BUDGET", "80000"))
+# the single Reduce request under the provider's per-request ceiling.
+# Raise via env when the gateway model has a large context window.
+REDUCER_CHAR_BUDGET = int(os.getenv("REDUCER_CHAR_BUDGET", "30000"))
 # Verifier policy per constraint kind when the record does not state it:
 # an indication or class the record never mentions means the trial is not
 # about it (exclude); a setting/design qualifier it omits is merely
@@ -2597,10 +2446,7 @@ def fetch_trials_exact(aliases: list[str], kind: str = "drug",
     sponsor field) unioned with a Qdrant full-text filtered scroll
     (interventionNames / LeadSponsorName MatchText) -- with EVERY
     candidate post-verified by the boundary-regex primitives, so neither
-    engine's matching looseness can leak a lookalike. This is what makes
-    small-N entities complete (exactly N rows) and large-N entities
-    honestly counted, independent of kNN's always-fills-its-quota
-    behavior and of which tools the agent happened to call.
+    engine's matching looseness can leak a lookalike.
 
     Returns (trials ordered live-first/newest-first capped at `cap`,
     total_verified_matches, verified_nct_ids). When `constraints` carry
@@ -2633,10 +2479,6 @@ def fetch_trials_exact(aliases: list[str], kind: str = "drug",
 
     # Qdrant full-text supplement (feature-detects the text index by just
     # trying; MatchText on a keyword index raises -> skip quietly).
-    # v3 collections index studiedInterventionNames (studied arms only);
-    # pre-migration ones only interventionNames -- try the exact field
-    # first, fall back to the broad one (the regex gate below still
-    # verifies every candidate either way).
     field_sets = ([["studiedInterventionNames", "interventionNames"],
                    ["interventionNames"]] if kind == "drug"
                   else [["LeadSponsorName", "collaborators"], ["LeadSponsorName"]])
@@ -2665,8 +2507,7 @@ def fetch_trials_exact(aliases: list[str], kind: str = "drug",
 
     # THE GUARANTEE: every candidate must verifiably STUDY the entity --
     # regex over studied-intervention/title tiers, or a graph INVESTIGATES
-    # edge (which covers synonyms the regex can't see). A summary-only
-    # mention is not enough.
+    # edge. A summary-only mention is not enough.
     verified = [t for nct, t in by_nct.items()
                 if nct in kg_ncts or _entity_matches_trial(patterns, t, kind)]
     if constraints:
@@ -2692,31 +2533,11 @@ RETURN count(DISTINCT t) AS total
 """
 
 # The MAPPED_TO_RXNORM hop is OPTIONAL MATCH, not part of the required
-# pattern -- found live on AWS: build_kg.py deliberately skips low-
-# confidence RxNorm links (MERGE_TRIAL_DRUG_ONLY), so unlicensed
-# development compounds (e.g. "ABX464") exist as Drug nodes with NO
-# Concept edge. With the hop mandatory, the traversal silently excluded
-# exactly the pipeline-stage assets a biopharma intelligence tool is most
-# often asked about, and the agent concluded "no results" for drugs the
-# graph actually contains. WITH...WHERE (not a bare WHERE after the
-# OPTIONAL MATCH) is load-bearing Cypher: a WHERE clause attached directly
-# to an OPTIONAL MATCH only filters the optional expansion, not the rows.
-# Verified live: unlike search_clinical_trials's kNN (which always returns at
-# most `limit` points), this Cypher traversal had NO limit at all -- for a
-# widely-studied drug like pembrolizumab it matched 1711 trials in one call,
-# every one of which would fan out to its own extract_trial worker. Capped
-# to the same TRIAL_SEARCH_LIMIT as search_clinical_trials so the two tools
-# that can populate the trials pool share one sane ceiling.
-#
-# ORDERING IS A RELEVANCE DECISION, found the hard way: the original
-# `ORDER BY t.id` (ascending, chosen only for determinism) returned the
-# OLDEST 60 of pembrolizumab's 1,705 trials -- audited live: every row
-# pre-2016, 49/56 COMPLETED/TERMINATED/WITHDRAWN. An analyst asking about
-# a drug wants the CURRENT pipeline, so: live-status trials first, then
-# newest registrations first (NCT ids are chronological). Still fully
-# deterministic (there is no
-# relevance score to rank by here -- every match equally satisfies the exact
-# entity query -- so id order is just for reproducibility, not priority).
+# pattern: build_kg.py skips low-confidence RxNorm links, so unlicensed
+# development compounds exist as Drug nodes with NO Concept edge. WITH...
+# WHERE (not a bare WHERE after the OPTIONAL MATCH) is load-bearing Cypher:
+# a WHERE attached directly to an OPTIONAL MATCH only filters the optional
+# expansion, not the rows.
 
 
 @tool
@@ -2758,9 +2579,8 @@ def query_knowledge_graph(entity: str) -> str:
     resolved = {}
     seen_ncts: set = set()
     for r in rows:
-        # A trial reached through several Drug nodes ("ABX464" and
-        # "ABX464 50mg") produces one row per node -- collapse to one
-        # trial (rows are already ordered best-first).
+        # A trial reached through several Drug nodes produces one row per
+        # node -- collapse to one trial (rows are already ordered best-first).
         if r["NCTId"] in seen_ncts:
             continue
         seen_ncts.add(r["NCTId"])
@@ -2770,18 +2590,9 @@ def query_knowledge_graph(entity: str) -> str:
         trials.append(t)
         resolved[r["cui"]] = r["standard_name"]
 
-    # Exact graph traversal, not kNN -- zero rows IS a genuine "not in the
-    # graph" signal here, unlike vector search's kNN (which always returns
-    # its k nearest points regardless of true relevance, hence the lexical
-    # grounding checks the other two tools need but this one doesn't).
-    #
-    # DETERMINISTIC FALLBACK on empty: the system prompt has always told
-    # the agent "empty graph result -> call search_clinical_trials", but
-    # verified live on AWS (Kimi orchestration) that the model routinely
-    # ignores that and concludes "no results" after the single empty tool
-    # round. Rather than depending on LLM compliance, the tool itself now
-    # runs the vector-search fallback and says so in its payload -- one
-    # tool call, guaranteed best answer across both stores.
+    # DETERMINISTIC FALLBACK on empty: rather than depending on the model to
+    # follow "empty graph result -> call search_clinical_trials", the tool
+    # itself runs the vector-search fallback and says so in its payload.
     if not trials:
         try:
             fallback = retrieve_trials(entity, limit=TRIAL_SEARCH_LIMIT)
@@ -2816,11 +2627,14 @@ TOOLS = [search_clinical_trials, search_pdf_literature, query_knowledge_graph,
          search_fda_records, search_pubmed_literature, search_sec_filings,
          search_corporate_news, get_safety_signals, search_fda_crls,
          get_exclusivity]
-# AACT text-to-SQL only joins the roster when credentials exist -- an
-# unconfigured tool the agent can select but that always errors would just
-# burn tool rounds (free registration: aact.ctti-clinicaltrials.org).
+# AACT text-to-SQL only joins the roster when credentials exist.
 if AACT_DB_URL:
     TOOLS.append(query_trial_statistics)
+# Small gateway models pick poorly among 10 tools -- trim via env, e.g.
+# AGENT_TOOLS=query_knowledge_graph,search_clinical_trials,search_pubmed_literature
+_only = [n.strip() for n in os.getenv("AGENT_TOOLS", "").split(",") if n.strip()]
+if _only:
+    TOOLS = [t for t in TOOLS if t.name in _only]
 
 
 # =============================================================================
@@ -2828,21 +2642,13 @@ if AACT_DB_URL:
 # =============================================================================
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
-    # Set once, from the authenticated caller's JWT (see auth.py), by
-    # whichever entry point built this state -- api.py's _initial_state()
-    # or main()'s CLI invocation (None there, no caller to attribute to).
-    # Read-only from every node's perspective: this is for LOGGING /
-    # attribution ("which tenant asked this"), not access control -- no
-    # node branches on it, and no Qdrant/Neo4j query is filtered by it. See
-    # auth.py's own module docstring SCOPE NOTE for why that's a
-    # deliberately separate, larger piece of work this does not attempt.
+    # Set once from the authenticated caller's JWT (see auth.py) by whichever
+    # entry point built this state. Read-only: for LOGGING / attribution,
+    # not access control.
     tenant_id: Optional[str]
     tool_rounds: int
     # The validated Smart Table object produced by the terminal node (any of
-    # synthesize_table / OutOfDomain / NoResultsFallback). Every exit path
-    # from the graph sets this to the SAME type, so the FastAPI layer and
-    # frontend never need to special-case a guardrail outcome vs. a normal
-    # answer.
+    # synthesize_table / OutOfDomain / NoResultsFallback).
     result: Optional[SmartTableResponse]
     # --- guardrail state -----------------------------------------------------
     is_in_domain: Optional[bool]
@@ -2851,68 +2657,33 @@ class AgentState(TypedDict):
     synthesis_error: Optional[str]
     # --- Map-Reduce state (Send-based parallel extraction) -------------------
     # operator.add on a list means "concatenate", not "overwrite" -- required
-    # here because MULTIPLE extract_trial workers write to extracted_rows in
-    # the same superstep. Without this reducer, LangGraph's default behaviour
-    # (last write wins) would mean N-1 of every N parallel workers' output is
-    # silently discarded instead of merged.
+    # because MULTIPLE extract_trial workers write to extracted_rows in the
+    # same superstep.
     retrieved_trials: Annotated[list[dict], operator.add]
     extracted_rows: Annotated[list[TrialRow], operator.add]
-    # Federated retrieval: chunks from search_pdf_literature, accumulated the
-    # same way as retrieved_trials. Unlike trials, literature chunks do NOT
-    # each spawn their own extract_trial worker -- there is no "one row per
-    # chunk" concept here, since a chunk isn't a trial. Instead the whole
-    # deduped pool is broadcast into every worker's Send payload (see
-    # continue_to_extraction) so each worker can judge which excerpts, if
-    # any, are actually about ITS trial.
+    # Federated retrieval pools. Non-trial chunks do NOT each spawn their own
+    # worker -- the whole deduped pool is broadcast into every worker's Send
+    # payload so each can judge which excerpts, if any, are about ITS trial.
     retrieved_literature: Annotated[list[dict], operator.add]
-    # Federated retrieval, third source: records from search_fda_records,
-    # accumulated the same way as retrieved_literature -- an FDA approval
-    # record doesn't spawn its own extract_trial worker either (it has no
-    # NCTId), it is broadcast into every worker's Send payload so each can
-    # judge whether it regulatorily matches ITS trial's drug(s).
     retrieved_fda: Annotated[list[dict], operator.add]
-    # Federated retrieval, fourth source: chunks from search_pubmed_literature
-    # -- same broadcast-to-every-worker treatment as retrieved_literature. A
-    # PubMed excerpt doesn't spawn its own extract_trial worker either (it
-    # has no NCTId); each worker judges whether it's about ITS trial's drug.
     retrieved_pubmed: Annotated[list[dict], operator.add]
-    # Federated retrieval, fifth source: chunks from search_sec_filings --
-    # same treatment again. A corporate filing excerpt is broadcast the same
-    # way; each worker judges whether it's about ITS trial's drug/sponsor.
     retrieved_sec: Annotated[list[dict], operator.add]
-    # Federated retrieval, sixth source: chunks from search_corporate_news
-    # -- same treatment again. A press-release/earnings-transcript excerpt
-    # is broadcast the same way; each worker judges whether it's about ITS
-    # trial's drug/sponsor.
     retrieved_news: Annotated[list[dict], operator.add]
-    # Federated retrieval, seventh source: chunks from search_fda_crls --
-    # FDA Complete Response Letters. Same broadcast treatment.
     retrieved_crls: Annotated[list[dict], operator.add]
-    # Live FAERS safety-signal payloads from get_safety_signals -- one dict
-    # per tool call (drug + ranked reaction signals), not chunks. Feeds the
-    # sources-only reducer; not broadcast to Map workers (drug-level data,
-    # not per-trial evidence).
+    # Live FAERS / LOE / AACT payloads: one dict per tool call. Feed the
+    # sources-only reducer; not broadcast to Map workers.
     retrieved_safety: Annotated[list[dict], operator.add]
-    # LOE/patent-cliff payloads from get_exclusivity -- same treatment as
-    # retrieved_safety (drug-level, sources-only reducer input).
     retrieved_exclusivity: Annotated[list[dict], operator.add]
-    # Exact-statistics payloads from query_trial_statistics (AACT SQL) --
-    # same sources-only treatment; the SQL and its rows ARE the evidence.
     retrieved_stats: Annotated[list[dict], operator.add]
-    # Exactness/completeness pipeline (see prepare_extraction_node):
-    # entities the user literally asked about (from the intent classifier),
-    # the prepared post-filter pools, and the TRUE match total + coverage
-    # note surfaced in the response.
+    # Exactness/completeness pipeline (see prepare_extraction_node)
     asked_entities: Optional[list]
     asked_constraints: Optional[dict]
     enforced_constraints: Optional[list]
     prepared_pools: Optional[dict]
     trial_total_matching: Optional[int]
     coverage_note: Optional[str]
-    # Per-worker input only. Set exclusively via the Send("extract_trial",
-    # {"single_trial": ..., "literature": ..., "fda_records": ..., ...})
-    # payload in continue_to_extraction -- no other node reads or writes
-    # these keys.
+    # Per-worker input only. Set exclusively via the Send("extract_trial", ...)
+    # payload in continue_to_extraction.
     single_trial: Optional[dict]
     literature: Optional[list[dict]]
     fda_records: Optional[list[dict]]
@@ -3045,10 +2816,10 @@ Rules:
   final answer, so do not write it yourself."""
 
 # --- Map stage prompt: EXACTLY one trial, no narrative, no other trials -----
-# The literature pool IS shared across all workers (see continue_to_extraction
-# and extract_trial_node) -- that's the one deliberate exception to "you never
-# see any other trial's data," because unlike a trial record, a literature
-# excerpt has no owning trial until a worker judges whether it matches theirs.
+# The literature pools ARE shared across all workers -- the one deliberate
+# exception to "you never see any other trial's data," because unlike a
+# trial record, an excerpt has no owning trial until a worker judges
+# whether it matches theirs.
 EXTRACTION_SYSTEM = """You are extracting exactly ONE row for a clinical
 trials comparison grid, from exactly ONE retrieved trial record -- plus,
 where genuinely relevant, findings from a shared pool of literature excerpts
@@ -3239,9 +3010,6 @@ manager, not a librarian listing records:
   efficacy")."""
 
 # --- Reduce stage, sources-only variant: no trial rows exist this run ------
-# (e.g. a corporate-strategy + mechanism question that never matched a
-# specific trial) -- write directly from whichever non-trial pools grounded,
-# instead of the trial-row-shaped REDUCER_SYSTEM contract above.
 SOURCES_ONLY_REDUCER_SYSTEM = """You are writing the final analyst answer for
 a life sciences market intelligence question that did NOT match any specific
 clinical trial in the registry.
@@ -3286,9 +3054,20 @@ provided pools below.
 
 INTENT_SYSTEM = """You are a fast input classifier guarding a clinical trials
 intelligence agent. Classify whether the user's question is in-domain:
-clinical trials, oncology, pharmaceutical drugs or biologics, trial sponsors,
-trial phases, or mechanisms of action -- including questions about drugs or
-compounds you don't recognise, since our database may still cover them.
+clinical trials, medical conditions/indications/diseases (e.g. oncology, cancer, leukemia, lymphoma, etc.),
+pharmaceutical drugs or biologics, trial sponsors, trial phases, or mechanisms of action --
+including questions about drugs or compounds you don't recognise, since our database may still cover them.
+ANY question asking about clinical trials or treatments for a disease is strictly IN-DOMAIN (is_in_domain=True).
+
+IMPORTANT: analytical, comparative, or table-building requests about clinical trials
+are FULLY IN-DOMAIN. Examples that MUST return is_in_domain=True:
+- "Compare the mechanisms and sponsors of Phase 3 oncology trials"
+- "Build a comparative table of Phase 3 lung cancer trials"
+- "Summarize all recruiting breast cancer trials"
+- "What are the latest immunotherapy trials?"
+- "List Phase 2 trials for diabetes"
+If the question mentions trials, drugs, diseases, phases, sponsors, or mechanisms
+in any form (questions, commands, comparisons, tables), it is IN-DOMAIN.
 
 Answer False for anything else: recipes, general chit-chat, coding help,
 unrelated science, or any topic that is not about clinical trials or pharma --
@@ -3333,27 +3112,40 @@ words in the question."""
 
 
 def build_llm(model: str, max_tokens: int = MAX_TOKENS, timeout: int = 180):
-    """ChatAnthropic bound to the tool schema, by default.
+    """Provider-routed chat model for the orchestration LLMs (agent + intent
+    gate). LLM_PROVIDER selects: custom (DEFAULT, Unistra gateway),
+    anthropic, groq, nvidia, kimi.
 
-    temperature/top_p are deliberately NOT set for Anthropic -- claude-opus-5
-    rejects them with a 400. Steer behaviour through the prompt instead.
-
-    LLM_PROVIDER=nvidia / LLM_PROVIDER=kimi are TEMPORARY escape hatches, not
-    a second production path: each reroutes every LLM in the graph (main
-    reasoning, intent gate, extraction, synthesis) through an OpenAI-
-    compatible endpoint via the same ChatOpenAI client construction already
-    verified working in evaluate_agent.py's build_judge() (ChatOpenAI
-    against integrate.api.nvidia.com, not ChatNVIDIA -- see that function's
-    own comment on why: ChatNVIDIA's aiohttp client has no configurable
-    socket-read timeout and reliably died on a long call). Added so this
-    graph can still be exercised end-to-end when Anthropic billing is
-    blocked; NOT verified to have equivalent bind_tools()/
-    with_structured_output() fidelity to Claude -- tool-calling and
-    structured-output behavior genuinely differs across providers/models,
-    so either is for unblocking a live test, not a claim it is
-    interchangeable with Claude in production.
+    For Anthropic: temperature/top_p are deliberately NOT set (claude-opus-5
+    rejects them with a 400). The non-Anthropic providers are OpenAI-
+    compatible via ChatOpenAI; tool-calling and structured-output fidelity
+    differs between models, so test the agent path before relying on one.
     """
-    provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
+    provider = _provider()
+
+    if provider == "custom":
+        return _build_custom_llm(timeout, max_tokens=max_tokens)
+
+    if provider == "groq":
+        from langchain_openai import ChatOpenAI
+
+        key = os.getenv("GROQ_API_KEY")
+        if not key:
+            raise SystemExit(
+                "[build_llm] LLM_PROVIDER=groq but GROQ_API_KEY is not set.\n"
+                "            Add it to .env — key at https://console.groq.com/keys"
+            )
+        return ChatOpenAI(
+            model=os.getenv("GROQ_AGENT_MODEL", GROQ_MAIN_MODEL),
+            base_url=GROQ_BASE_URL,
+            api_key=key,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            # The graph's own retry loops are the single retry layer, so the
+            # SDK never overlaps requests.
+            max_retries=0,
+        )
+
     if provider == "nvidia":
         from langchain_openai import ChatOpenAI
 
@@ -3370,7 +3162,6 @@ def build_llm(model: str, max_tokens: int = MAX_TOKENS, timeout: int = 180):
             api_key=key,
             max_tokens=max_tokens,
             timeout=timeout,
-            # See the kimi branch's comment below -- same root cause, same fix.
             max_retries=0,
         )
 
@@ -3383,40 +3174,20 @@ def build_llm(model: str, max_tokens: int = MAX_TOKENS, timeout: int = 180):
                 "[build_llm] LLM_PROVIDER=kimi but KIMI_API_KEY is not set.\n"
                 "            Add it to .env — get a key at https://platform.moonshot.ai"
             )
-        # Both overridable: KIMI_BASE_URL for the .cn endpoint if that's
-        # where the key is provisioned, KIMI_MODEL once a specific model is
-        # confirmed live rather than guessed.
         return ChatOpenAI(
             model=os.getenv("KIMI_MODEL", "kimi-k3"),
             base_url=os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/v1"),
             api_key=key,
             max_tokens=max_tokens,
             timeout=timeout,
-            # max_retries=0 (openai's own client default is 2): verified
-            # live to matter, not a guess. The landscape pipeline's call is
-            # large and slow (tens of thousands of tokens); on a 429/timeout
-            # the openai SDK's own automatic retry fires a NEW request
-            # immediately, but the FIRST attempt can still be processing on
-            # the provider's servers -- against this key's "max organization
-            # concurrency: 1" limit, that overlap is a self-inflicted
-            # collision: the retry gets rate-limited by the still-running
-            # original, repeatedly, until every retry is exhausted. Disabling
-            # the SDK's own retry means a failure surfaces immediately and
-            # cleanly instead, and synthesize_node's own MAX_SYNTHESIS_RETRIES
-            # loop (sequential -- each attempt's HTTP call fully completes,
-            # success or exception, before the next one starts) is what
-            # retries instead, without ever having two requests in flight.
+            # max_retries=0: with a "max organization concurrency: 1" limit,
+            # the SDK's own automatic retry fires a NEW request while the
+            # first may still be processing, colliding with itself. The
+            # graph's sequential retry loops are the retry layer instead.
             max_retries=0,
-            # thinking disabled: verified live -- kimi-k3 defaults to an
-            # internal "thinking" (reasoning) mode that Moonshot's own API
-            # flatly rejects combining with a forced tool_choice ("tool_choice
-            # 'specified' is incompatible with thinking enabled", a real
-            # openai.BadRequestError hit by with_structured_output's
-            # function_calling method, which forces the one tool). Probed
-            # directly against the endpoint: {"thinking": {"type":
-            # "disabled"}} in the request body clears the conflict AND avoids
-            # burning max_tokens on invisible reasoning (see the
-            # reasoning_tokens=15997/16000 case in this project's history).
+            # kimi-k3 defaults to a thinking mode that Moonshot's API rejects
+            # in combination with a forced tool_choice (needed by
+            # function_calling structured output).
             extra_body={"thinking": {"type": "disabled"}},
         )
 
@@ -3426,64 +3197,55 @@ def build_llm(model: str, max_tokens: int = MAX_TOKENS, timeout: int = 180):
 
 
 # extract_trial_node's own per-call timeout -- a single-trial structured
-# extraction is far smaller than the landscape/catalyst mega-calls
-# LANDSCAPE_TIMEOUT/CATALYST_TIMEOUT budget for, so this is deliberately
-# tighter; see extraction_llm's own comment in make_graph for why it is
-# pinned to _build_gpt4o_llm at all.
+# extraction is far smaller than the landscape/catalyst mega-calls.
 EXTRACTION_TIMEOUT = 60
 
-# Caps how many extract_trial workers actually call the OpenAI API at once.
-# Verified live at TRIAL_SEARCH_LIMIT=50/93: with every Send worker firing
-# its gpt-4o call simultaneously (LangGraph does not throttle Send fanout on
-# its own), this project's OpenAI org hit "Rate limit reached for gpt-4o ...
-# tokens per min (TPM): Limit 30000" within the first ~4 calls -- each
-# extraction prompt runs ~8000 tokens (full trial record + every shared
-# evidence pool), so the account can sustain only ~3-4 calls/minute, not 50
-# truly concurrent ones. A low semaphore, not a higher TPM tier, is the fix
-# available here -- it trades wall-clock time (a 50-row query now takes
-# minutes, not seconds) for actually finishing instead of most workers
-# 429-ing and silently dropping their row.
-EXTRACTION_CONCURRENCY = 3
+# Caps how many extract_trial workers actually call the main-tier LLM at once.
+# LangGraph does not throttle Send fanout on its own; a shared gateway or a
+# free-tier TPM budget cannot absorb 60-150 simultaneous calls. Env-overridable.
+EXTRACTION_CONCURRENCY = int(os.getenv("EXTRACTION_CONCURRENCY", "2"))
 _extraction_semaphore = threading.Semaphore(EXTRACTION_CONCURRENCY)
 
-# The mini tier was UNTHROTTLED before POOL_MAX_TRIALS raised fanouts to 150
-# -- 150 simultaneous gpt-4o-mini calls both burn the mini TPM budget in one
-# burst (turning cheap 429s into gpt-4o escalations, each of which then
-# queues on the 3-slot semaphore above: the real latency bomb at scale) and
-# hammer the local embedding/ONNX thread pool. 12 concurrent mini calls
-# keeps the pipe full without tripping the burst limit.
+# The mini tier is throttled too: unbounded 150-wide mini bursts both burn
+# the mini TPM budget in one go and hammer the local embedding/ONNX pool.
 EXTRACTION_MINI_CONCURRENCY = int(os.getenv("EXTRACTION_MINI_CONCURRENCY", "12"))
 _extraction_mini_semaphore = threading.Semaphore(EXTRACTION_MINI_CONCURRENCY)
 
-# Matches openai's own "...please try again in 16.29s..." message text --
-# sleeping exactly what the API itself says to (plus a small buffer) adapts
-# to whatever the account's real TPM budget is at the moment, rather than
-# guessing a fixed backoff that's either too short (still 429s) or too long
-# (wastes time when the budget already refilled).
-# Matches both provider dialects observed live: OpenAI's "please try again
-# in 1.2s" AND Kimi/Moonshot's "please try again after 1 seconds".
-_RETRY_AFTER_RE = re.compile(r"try again (?:in|after) ([\d.]+)\s*s")
+# Handles minutes, seconds and milliseconds in a provider's own 429 message:
+# "in 1.2s", "after 1 seconds", "in 340ms", "in 1m23.4s".
+_RETRY_AFTER_RE = re.compile(
+    r"try again (?:in|after) (?:(\d+)m)?\s*([\d.]+)\s*(ms|s)\b")
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Seconds the provider's own 429 message asks us to wait, or None when
+    the message carries no parseable hint (caller then uses its own
+    backoff)."""
+    m = _RETRY_AFTER_RE.search(str(exc))
+    if not m:
+        return None
+    mins, val, unit = m.groups()
+    secs = float(val) / 1000.0 if unit == "ms" else float(val)
+    return secs + 60.0 * int(mins or 0)
 
 
 def _invoke_ratelimit_retry(llm, msgs, *, attempts: int = 4, label: str = "",
                             verbose: bool = True):
     """invoke() with rate-limit patience for the ORCHESTRATION provider.
 
-    Exists because of a real prod 502: the Kimi free tier enforces
-    "organization max RPM: 3", and with max_retries=0 on the client (a
-    deliberate choice -- see build_llm) a single 429 during the agent or
-    narrative step killed the entire multi-minute run. Waits what the
-    provider's own message asks for (both dialects parsed by
-    _RETRY_AFTER_RE), with a floor that actually clears an RPM window, and
-    re-raises after `attempts` so genuine outages still fail loudly."""
+    With max_retries=0 on the client (a deliberate choice -- see build_llm),
+    a single 429 during the agent or narrative step would otherwise kill the
+    whole multi-minute run. Waits what the provider's own message asks for,
+    with a floor that actually clears an RPM window, and re-raises after
+    `attempts` so genuine outages still fail loudly."""
     for attempt in range(attempts):
         try:
             return llm.invoke(msgs)
         except openai.RateLimitError as exc:
             if attempt == attempts - 1:
                 raise
-            m = _RETRY_AFTER_RE.search(str(exc))
-            wait = max(float(m.group(1)) if m else 0.0, 8.0 * (attempt + 1))
+            ra = _retry_after_seconds(exc)
+            wait = max(ra or 0.0, 8.0 * (attempt + 1))
             if verbose:
                 print(f"  ⚠ rate-limited{f' ({label})' if label else ''} "
                       f"(attempt {attempt + 1}/{attempts}), waiting {wait:.0f}s")
@@ -3496,106 +3258,77 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
     tool_node = ToolNode(TOOLS)
 
     # --- Map stage: one structured call per trial, run in parallel ---------
-    # Pinned to _build_gpt4o_llm, NOT the provider-routed `llm` above --
-    # TRIAL_SEARCH_LIMIT=50 means a single Smart Table query can now fan out
-    # up to 50 concurrent extract_trial calls (continue_to_extraction Sends
-    # one per distinct trial, uncapped). That is exactly the failure shape
-    # _build_gpt4o_llm's own docstring documents for kimi/nvidia: kimi's key
-    # hits a hard "max organization concurrency: 1" / observed "max RPM: 3"
-    # quota, so under real load most of those 50 parallel calls would 429
-    # and extract_trial_node's broad except silently drops each one -- more
-    # retrieval breadth would have made the row count WORSE, not better.
-    # gpt-4o has no such ceiling and is already a hard project dependency
-    # (embeddings.py), so this is the same fix already applied to the
-    # landscape/catalyst Map-scale calls, extended to this one. Real API
-    # cost note: up to 50 gpt-4o calls per query now, vs. whatever
-    # LLM_PROVIDER was routing to before.
+    # Pinned to _build_gpt4o_llm (the "main tier"), NOT the provider-routed
+    # `llm` above. Under the default provider this is the Unistra model;
+    # under groq it is the Groq main model. Structured output is forced
+    # through STRUCTURED_METHOD (default function_calling).
     extraction_llm = _build_gpt4o_llm(
         EXTRACTION_TIMEOUT, model_env_var="EXTRACTION_MODEL"
-    ).with_structured_output(TrialRow)
+    ).with_structured_output(TrialRow, method=STRUCTURED_METHOD)
 
     # --- extraction cost cascade ------------------------------------------
-    # Most trial records are formulaic registry text a mini-tier model
-    # extracts correctly; only ambiguous rows need full gpt-4o. Each Map
-    # worker therefore tries EXTRACTION_MODEL_MINI (default gpt-4o-mini)
-    # first, validates the structured result deterministically
-    # (_cascade_acceptable below -- schema parse + critical fields), and
-    # escalates to the pinned gpt-4o ONLY on failure. Beyond the ~15x price
-    # gap, the mini tier has its own separate TPM budget, so most workers
-    # no longer queue against the 30K-TPM gpt-4o ceiling that made large
-    # extractions take 5-10 minutes (see EXTRACTION_CONCURRENCY).
+    # Each Map worker tries the "mini" tier first, validates deterministically
+    # (_cascade_acceptable), and escalates to the main tier only on failure.
+    # Under the single-model custom provider the cascade is skipped
+    # (_CASCADE_ENABLED=False) since escalating would repeat the same call.
     # include_raw=True so a schema-parse failure surfaces as data
-    # (parsing_error) to trigger escalation instead of raising, and so
-    # usage metadata (cached-token counts) is loggable.
+    # (parsing_error) instead of raising.
     extraction_llm_mini = _build_gpt4o_llm(
         EXTRACTION_TIMEOUT, model_env_var="EXTRACTION_MODEL_MINI",
-        default_model="gpt-4o-mini",
-    ).with_structured_output(TrialRow, include_raw=True)
+        default_model="gpt-4o-mini",  # "mini" in the name -> fast tier
+    ).with_structured_output(TrialRow, include_raw=True, method=STRUCTURED_METHOD)
 
-    # Constraint pipeline helpers, both on the mini tier: class/target
-    # phrases -> KB vocabulary (one call per query), and the per-candidate
-    # verifier (one call per VERIFIER_BATCH candidates).
+    # Constraint pipeline helpers (mini tier): class/target phrases -> KB
+    # vocabulary, and the per-candidate verifier.
     class_llm = _build_gpt4o_llm(
         30, model_env_var="EXTRACTION_MODEL_MINI", default_model="gpt-4o-mini",
-    ).with_structured_output(ClassExpansions)
+    ).with_structured_output(ClassExpansions, method=STRUCTURED_METHOD)
     verifier_llm = _build_gpt4o_llm(
         EXTRACTION_TIMEOUT, model_env_var="EXTRACTION_MODEL_MINI",
         default_model="gpt-4o-mini",
-    ).with_structured_output(VerifierBatch)
+    ).with_structured_output(VerifierBatch, method=STRUCTURED_METHOD)
 
     # --- Reduce stage: prose only -- table_data is already fixed by the Map
-    # stage, so this call carries far less risk than the old Synthesis call
-    # did, but keeps the same validate-or-retry shape for consistency.
-    # Pinned to gpt-4o, NOT the provider-routed `llm` -- verified live that
-    # Kimi repeatedly fails this structured call in sources-only mode
-    # (FAERS/CRL JSON payloads): 2-3 consecutive "model did not return the
-    # expected structure" validation errors per query, exhausting the
-    # retry budget and surfacing "unable to produce a validly structured
-    # response" to real users. Same class of decision as extraction_llm:
-    # Kimi handles tool-calling orchestration fine, but evidence-dense
-    # structured synthesis goes to the model that reliably emits schema.
+    # stage. Same validate-or-retry shape as before.
     narrative_llm = _build_gpt4o_llm(
         EXTRACTION_TIMEOUT, model_env_var="NARRATIVE_MODEL"
     ).with_structured_output(
-        NarrativeSummary, include_raw=True, method="function_calling"
+        NarrativeSummary, include_raw=True, method=STRUCTURED_METHOD
     )
 
-    # Separate, cheap/fast model for the input guardrail -- see INTENT_MODEL.
-    # max_tokens=1536, not the smaller value this had before: verified
-    # directly under LLM_PROVIDER=nvidia (see build_llm's docstring) that
-    # NVIDIA's Nemotron model reliably burns several hundred tokens on its
-    # own internal reasoning before it ever emits the tiny IntentClassification
-    # payload -- 512 hit openai.LengthFinishReasonError consistently, not
-    # intermittently, on ordinary in-domain questions. Harmless headroom for
-    # Claude, which was never close to that ceiling for this task.
+    # Intent gate. max_tokens=1536: reasoning-style models burn several
+    # hundred tokens before emitting the tiny IntentClassification payload.
     intent_llm = build_llm(INTENT_MODEL, max_tokens=1536, timeout=60) \
-        .with_structured_output(IntentClassification, method="function_calling")
-    # Fallback classifier on OpenAI's mini tier: the provider-routed intent
-    # model (Kimi locally) intermittently returns no tool call at all, and
-    # failing open with NO constraints silently drops every qualifier the
-    # user typed -- the exact failure the constraint pipeline exists to
-    # prevent. One reliable structured call is worth far more than that.
+        .with_structured_output(IntentClassification, method=STRUCTURED_METHOD)
+    # Fallback classifier on the fast tier: the provider-routed intent model
+    # intermittently returns no tool call at all, and failing open with NO
+    # constraints silently drops every qualifier the user typed.
     intent_fallback_llm = _build_gpt4o_llm(
         30, model_env_var="EXTRACTION_MODEL_MINI", default_model="gpt-4o-mini",
-    ).with_structured_output(IntentClassification)
+    ).with_structured_output(IntentClassification, method=STRUCTURED_METHOD)
 
     # --- node: IntentClassifier --------------------------------------------
     def intent_classifier_node(state: AgentState) -> dict:
         question = next(
             (m.content for m in state["messages"] if isinstance(m, HumanMessage)), ""
         )
-        # Small retry loop, not a graph-level one like synthesize_node's --
-        # verified live (LLM_PROVIDER=kimi) that despite the forced
-        # tool_choice from method="function_calling", kimi-k3 intermittently
-        # answers in plain prose instead of calling the IntentClassification
-        # tool for the SAME question that calls it correctly on other
-        # attempts (Moonshot's forced tool_choice isn't as strictly enforced
-        # server-side as real OpenAI's) -- with_structured_output then
-        # returns None with no exception, since a genuinely empty tool_calls
-        # list isn't a schema-validation failure. Two retries have been
-        # enough live; a persistent failure fails OPEN (in-domain) rather
-        # than wrongly gatekeeping a legitimate clinical question on what is
-        # a guardrail, not the actual answer.
+
+        # ---- regex pre-screen: skip the LLM for obviously clinical queries ---
+        # Small models (e.g. ministral) misclassify analytical queries like
+        # "Compare Phase 3 oncology trials" as out-of-domain.  When the query
+        # contains unambiguous clinical keywords we short-circuit to in-domain,
+        # still running the LLM to extract entities/constraints but overriding
+        # the is_in_domain verdict if the model disagrees.
+        obviously_clinical = _is_obviously_clinical(question)
+        if obviously_clinical and verbose:
+            print("  ✓ regex pre-screen: query contains clinical keywords — "
+                  "will override any out-of-domain verdict")
+
+        # Small retry loop: some models intermittently answer in plain prose
+        # instead of calling the IntentClassification tool, and
+        # with_structured_output then returns None with no exception. A
+        # persistent failure fails OPEN (in-domain) rather than wrongly
+        # gatekeeping a legitimate clinical question on a guardrail.
         verdict: IntentClassification | None = None
         for attempt in range(3):
             verdict = _invoke_ratelimit_retry(intent_llm, [
@@ -3613,7 +3346,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                     SystemMessage(content=INTENT_SYSTEM),
                     HumanMessage(content=question)])
                 if verbose and verdict is not None:
-                    print("  ↳ intent classifier: OpenAI fallback answered")
+                    print("  ↳ intent classifier: fallback answered")
             except Exception as exc:  # noqa: BLE001
                 if verbose:
                     print(f"  ↳ intent fallback failed too: {exc}")
@@ -3628,8 +3361,20 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                     "asked_constraints": _regex_constraints(question)}
         if verbose:
             _trace_intent(verdict)
+
+        # Override: if the regex pre-screen flagged the query as obviously
+        # clinical but the LLM disagreed, trust the regex.  We still keep
+        # the LLM's extracted entities and constraints (they're useful even
+        # when the domain verdict is wrong).
+        in_domain = verdict.is_in_domain
+        if obviously_clinical and not in_domain:
+            if verbose:
+                print("  ⚠ OVERRIDE: LLM said out-of-domain but query "
+                      "contains clinical keywords — forcing in-domain")
+            in_domain = True
+
         constraints = (verdict.constraints or QueryConstraints()).model_dump()
-        return {"is_in_domain": verdict.is_in_domain,
+        return {"is_in_domain": in_domain,
                 "asked_entities": [e.model_dump() for e in
                                    (verdict.exact_entities or [])],
                 "asked_constraints": constraints}
@@ -3657,17 +3402,9 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
         return {"messages": [reply]}
 
     # --- node: Tool Node (wrapped for tracing + grounding aggregation) -----
-    # Takes `config` explicitly (LangGraph injects it) and forwards it to
-    # tool_node.invoke() rather than relying on tool_node picking up an
-    # ambient RunnableConfig on its own -- verified live that this ambient
-    # pickup silently breaks on the astream() (streaming) path specifically:
-    # this node runs in a thread-pool executor there (run_in_executor), and
-    # langgraph 1.2.11 (this project's own `langgraph>=1.0.0` pin floated
-    # up to it) raises `ValueError: Missing required config key 'N/A' for
-    # 'tools'` inside ToolNode.invoke() when it can't recover a config from
-    # that thread on its own. The plain (non-streaming) /api/research path
-    # never hit this because its node runs on the graph's own thread, where
-    # the ambient config happens to still be reachable.
+    # Takes `config` explicitly and forwards it to tool_node.invoke(): the
+    # ambient RunnableConfig is not recoverable on the astream() path (this
+    # node runs in a thread-pool executor there).
     def tools_node(state: AgentState, config: RunnableConfig) -> dict:
         out = tool_node.invoke(state, config)
         round_grounded = False
@@ -3686,11 +3423,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                 _trace_tool_result(m)
             try:
                 payload = json.loads(m.content)
-                # Any one tool's grounding is enough -- a query that only
-                # search_pdf_literature (or search_fda_records) can ground
-                # should still be treated as "something real was found," not
-                # routed to NoResultsFallback just because the OTHER tools
-                # came up empty on their own corpus.
+                # Any one tool's grounding is enough.
                 if payload.get("has_results"):
                     round_grounded = True
                 new_trials.extend(payload.get("trials", []))
@@ -3717,10 +3450,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                 pass
 
         # Sticky-OR across rounds: once ANY round finds grounded results,
-        # stay True even if a later refinement search comes back empty --
-        # otherwise a single unlucky follow-up query would kill an
-        # already-successful earlier round. An ungrounded FIRST round (no
-        # prior True to inherit) still correctly triggers NoResultsFallback.
+        # stay True even if a later refinement search comes back empty.
         prior = state.get("has_results")
         has_results = bool(prior) or round_grounded
         return {"messages": out["messages"],
@@ -3766,17 +3496,12 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                   f"{len(news_chunks)} corporate news excerpt(s) available)"
                   f"\n{'─' * 78}")
 
-        # PROMPT ORDERING IS A COST FEATURE, not a readability choice: the
-        # five evidence pools below are IDENTICAL across every Map worker
-        # in a run (they're the shared retrieval state), while the trial
-        # record is unique per worker. Shared-invariant content first +
-        # per-worker content last means [system prompt + all pools] forms
-        # one long identical prefix across the whole fan-out, which OpenAI
-        # prompt caching serves at half price after the first worker warms
-        # it (automatic, >=1024-token prefixes; EXTRACTION_SYSTEM alone is
-        # ~1.9K tokens). The previous ordering -- trial record FIRST --
-        # made every worker's prompt diverge at token ~1 and guaranteed a
-        # 0% cache hit rate on exactly the fan-out that dominates spend.
+        # PROMPT ORDERING IS A COST FEATURE: the evidence pools are IDENTICAL
+        # across every Map worker in a run, while the trial record is unique
+        # per worker. Shared-invariant content first + per-worker content
+        # last makes [system prompt + all pools] one long identical prefix
+        # across the fan-out, which providers with prompt caching serve at a
+        # discount after the first worker warms it.
         prompt = ""
         if literature:
             prompt += (
@@ -3855,18 +3580,14 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
         )
         record_text = _norm_ws(json.dumps(trial))  # for verbatim evidence checks
 
-        # _extraction_semaphore + a generous retry budget, not a single quick
-        # retry -- at up to TRIAL_SEARCH_LIMIT=50 concurrent workers, the
-        # bottleneck verified live is a hard account-level TPM ceiling (see
-        # EXTRACTION_CONCURRENCY's comment), not an occasional hiccup. The
-        # semaphore keeps at most EXTRACTION_CONCURRENCY calls in flight;
-        # the retry loop below then absorbs the 429s that still happen at
-        # the boundary of that budget by sleeping exactly as long as the API
-        # says to. Anything else (schema/parsing failure, a genuinely bad
-        # request) still fails this worker immediately on its first
-        # non-transient exception -- one flaky row must not sink the batch,
-        # and retrying a non-transient error would just waste the same
-        # failure again.
+        # _extraction_semaphore + a generous retry budget: at a large fanout
+        # the bottleneck is a hard account/gateway-level rate ceiling (see
+        # EXTRACTION_CONCURRENCY), not an occasional hiccup. The semaphore
+        # keeps at most EXTRACTION_CONCURRENCY calls in flight; the retry
+        # loop absorbs the 429s that still happen at the boundary by
+        # sleeping exactly as long as the API says to. Anything else (schema
+        # failure, bad request) fails this worker immediately -- one flaky
+        # row must not sink the batch.
         messages = [SystemMessage(content=EXTRACTION_SYSTEM),
                     HumanMessage(content=prompt)]
 
@@ -3881,13 +3602,9 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
         def _cascade_acceptable(candidate: TrialRow | None) -> bool:
             """Deterministic accept gate for the mini tier: the schema
             parsed AND the critical identity fields are present and honest
-            (nct_id must match the record this worker was given -- a
-            mismatched id is the classic small-model copy error and would
-            poison the table). Also escalates when mini found NO mechanism
-            although the record carries mechanism-bearing text and the KB
-            has nothing for it -- evidence existed and the small model
-            missed it; when there is genuinely nothing to read, an empty
-            mechanism is the right answer and costs no escalation."""
+            (nct_id must match the record this worker was given). Also
+            escalates when mini found NO mechanism although the record
+            carries mechanism-bearing text and the KB has nothing for it."""
             if (candidate is None
                     or (candidate.nct_id or "").strip() != nct_id
                     or not (candidate.phase or "").strip()
@@ -3898,23 +3615,15 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                 return False
             return True
 
-        # --- tier 1: mini model, outside the gpt-4o semaphore -----------
-        # The semaphore exists purely to ration the 30K-TPM gpt-4o budget;
-        # mini has its own (much larger) budget, so serializing mini calls
-        # behind it would rebuild the very queue the cascade removes.
+        # --- tier 1: mini model, outside the main-tier semaphore ----------
         row: TrialRow | None = None
         tier = "mini"
         with _extraction_mini_semaphore:
-            # One retry-after-guided second chance on a mini 429 before
-            # escalating: a mini rate-limit is transient and cheap to wait
-            # out, while an escalation burns one of the THREE gpt-4o slots
-            # for ~20s -- at a 150-row fanout, letting every burst-429
-            # escalate is what turns a 2-minute run into a 20-minute one.
             # Up to MINI_ATTEMPTS retry-after-guided retries: a mini 429 is
-            # transient and cheap to wait out, while escalating burns one
-            # of the THREE gpt-4o slots -- at a 150-row fanout that turns a
-            # 2-minute run into a 20-minute 429 storm on the 30K-TPM tier.
-            for mini_attempt in range(MINI_ATTEMPTS):
+            # transient and cheap to wait out, while escalating burns one of
+            # the few main-tier slots. Skipped entirely (range(0)) when the
+            # cascade is disabled -- one model, nothing to escalate to.
+            for mini_attempt in range(MINI_ATTEMPTS if _CASCADE_ENABLED else 0):
                 try:
                     out = extraction_llm_mini.invoke(messages)
                     parsed = out.get("parsed")
@@ -3927,27 +3636,26 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                                   f"(cached input tokens: {cached})")
                     elif verbose:
                         why = out.get("parsing_error") or "critical-field check failed"
-                        print(f"  ↳ {nct_id}: mini tier rejected ({why}) — escalating to gpt-4o")
+                        print(f"  ↳ {nct_id}: mini tier rejected ({why}) — escalating to main model")
                     break
                 except openai.RateLimitError as exc:
                     if mini_attempt < MINI_ATTEMPTS - 1:
-                        m = _RETRY_AFTER_RE.search(str(exc))
-                        wait = (min(float(m.group(1)), 30.0) + 1.0 if m
+                        ra = _retry_after_seconds(exc)
+                        wait = (min(ra, 30.0) + 1.0 if ra is not None
                                 else 5.0 * (mini_attempt + 1))
                         if verbose:
                             print(f"  ↳ {nct_id}: mini tier 429, retrying in {wait:.1f}s")
                         time.sleep(wait)
                     elif verbose:
-                        print(f"  ↳ {nct_id}: mini tier 429 x{MINI_ATTEMPTS} — escalating to gpt-4o")
+                        print(f"  ↳ {nct_id}: mini tier 429 x{MINI_ATTEMPTS} — escalating to main model")
                 except Exception as exc:  # noqa: BLE001 -- any other mini failure just escalates
                     if verbose:
-                        print(f"  ↳ {nct_id}: mini tier errored ({exc}) — escalating to gpt-4o")
+                        print(f"  ↳ {nct_id}: mini tier errored ({exc}) — escalating to main model")
                     break
 
-        # --- tier 2: pinned gpt-4o, semaphore + adaptive retry (unchanged
-        # from the pre-cascade behavior; see EXTRACTION_CONCURRENCY) ------
+        # --- tier 2: pinned main model, semaphore + adaptive retry ---------
         if row is None:
-            tier = "gpt-4o"
+            tier = "main"
             MAX_EXTRACTION_ATTEMPTS = 5
             with _extraction_semaphore:
                 for attempt in range(MAX_EXTRACTION_ATTEMPTS):
@@ -3962,8 +3670,8 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                                       f"({time.time() - started:.1f}s) after "
                                       f"{MAX_EXTRACTION_ATTEMPTS} attempts: {exc} — dropping this row")
                             return {"extracted_rows": []}
-                        m = _RETRY_AFTER_RE.search(str(exc))
-                        wait = min(float(m.group(1)), 30.0) + 1.0 if m else 5.0 * (attempt + 1)
+                        ra = _retry_after_seconds(exc)
+                        wait = min(ra, 30.0) + 1.0 if ra is not None else 5.0 * (attempt + 1)
                         if verbose:
                             print(f"  ⚠ transient error for {nct_id} "
                                   f"(attempt {attempt + 1}/{MAX_EXTRACTION_ATTEMPTS}), "
@@ -3975,26 +3683,30 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                                   f"({time.time() - started:.1f}s): {exc} — dropping this row")
                         return {"extracted_rows": []}
 
+        # A model that answers in prose instead of calling the schema tool
+        # makes with_structured_output return None with no exception; drop
+        # the row rather than crash on attribute access below.
+        if row is None:
+            if verbose:
+                print(f"  ✗ extraction returned no structured row for {nct_id} — dropping")
+            return {"extracted_rows": []}
+
         # Registry provenance is deterministic, never model-supplied: every
         # row's primary source IS its ClinicalTrials.gov record, so build
         # that citation from the worker's own nct_id and keep only NON-
-        # registry citations from the model (dropping any registry entry it
-        # improvised, which may carry a hallucinated URL).
+        # registry citations from the model.
         row.sources = [SourceCitation(
             source_type="registry", reference=nct_id,
             url=f"https://clinicaltrials.gov/study/{nct_id}",
         )] + [s for s in (row.sources or []) if s.source_type != "registry"]
 
-        # Indication and status come from the record, not the model -- the
-        # worker literally holds the trial payload, so copying via an LLM
-        # would only add error. Same policy as the registry citation.
+        # Indication and status come from the record, not the model.
         conds = [c for c in (trial.get("conditions") or []) if isinstance(c, str)]
         row.indication = ", ".join(conds[:2]) + (" +" if len(conds) > 2 else "")
         row.status = (trial.get("OverallStatus") or "").replace("_", " ").title()
 
-        # Placebo-only arm labels add table noise without information (the
-        # comparator structure is already in mechanism_or_findings when it
-        # matters); combination entries that merely CONTAIN placebo stay.
+        # Placebo-only arm labels add table noise without information;
+        # combination entries that merely CONTAIN placebo stay.
         row.interventions = [iv for iv in row.interventions
                              if not re.match(r"^placebos?( for .+| capsule| tablet)?$",
                                              iv.strip(), re.I)]
@@ -4013,19 +3725,19 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
     _PHASE_RANK = {"Phase 4": 5, "Phase 3": 4, "Phase 2/Phase 3": 3.5,
                    "Phase 2": 3, "Phase 1/Phase 2": 2.5, "Phase 1": 2,
                    "Early Phase 1": 1.5}
-    _LIVE_STATUSES = {"Recruiting", "Active Not Recruiting",
-                      "Not Yet Recruiting", "Enrolling By Invitation"}
+    _LIVE_ROW_STATUSES = {"Recruiting", "Active Not Recruiting",
+                          "Not Yet Recruiting", "Enrolling By Invitation"}
 
     def _order_rows(rows: list) -> list:
         """Deterministic analyst ordering: latest-phase first, live trials
-        before dead ones, newest registrations first. Found necessary by
-        audit: Map workers finish in arbitrary order, so a Phase 1
-        investigator study could sit above a registrational Phase 3."""
+        before dead ones, newest registrations first. Map workers finish in
+        arbitrary order, so without this a Phase 1 investigator study could
+        sit above a registrational Phase 3."""
         def _key(r):
             phase_rank = max((v for k, v in _PHASE_RANK.items()
                               if k.lower() in (r.phase or "").lower()),
                              default=0)
-            live = 1 if (r.status or "") in _LIVE_STATUSES else 0
+            live = 1 if (r.status or "") in _LIVE_ROW_STATUSES else 0
             nct_num = int(re.sub(r"\D", "", r.nct_id) or 0)
             return (-phase_rank, -live, -nct_num)
         return sorted(rows, key=_key)
@@ -4054,12 +3766,9 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
             return resp
 
         # No trial rows this run: either genuinely nothing was found, or the
-        # agent grounded on non-trial pools only (e.g. a corporate-strategy +
-        # mechanism question that never matched a specific trial -- see
-        # continue_to_extraction's routing comment). _deduped_pools recomputes
+        # agent grounded on non-trial pools only. _deduped_pools recomputes
         # the same non-trial pools it would have broadcast to Map workers, so
-        # this branch can answer from them directly instead of assuming
-        # "no trial" means "no evidence at all."
+        # this branch can answer from them directly.
         pools = _deduped_pools(state) if not rows else None
         safety_payloads = state.get("retrieved_safety") or []
         exclusivity_payloads = state.get("retrieved_exclusivity") or []
@@ -4143,11 +3852,8 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                 )
             # The narrative needs the analytical fields only -- the
             # audit-trail fields (constraints, sources, mechanism_evidence)
-            # roughly tripled each row, and at a 150-row fanout the full
-            # dump exceeded gpt-4o's 30K-TPM ceiling IN ONE REQUEST
-            # ("Request too large", not a transient 429 -- no retry can
-            # fix that). Slim rows first; if still over budget, write the
-            # prose from the leading rows and say so.
+            # roughly triple each row. Slim rows first; if still over
+            # budget, write the prose from the leading rows and say so.
             slim = [{k: v for k, v in r.model_dump().items()
                      if k in ("nct_id", "sponsor", "phase", "interventions",
                               "indication", "status", "mechanism",
@@ -4173,8 +3879,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
 
         prior_error = state.get("synthesis_error")
         if prior_error:
-            # This is the "inject the error context back into state" step:
-            # the failed attempt's own validation error becomes part of the
+            # Inject the failed attempt's own validation error back into the
             # next prompt, so the model sees exactly what it got wrong.
             prompt += (
                 f"\n\nYOUR PREVIOUS ATTEMPT FAILED SCHEMA VALIDATION:\n{prior_error}\n"
@@ -4182,17 +3887,15 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
             )
 
         # attempts=8: the Reduce call starts the moment the last Map worker
-        # returns, i.e. exactly when the 30K-TPM gpt-4o window is fullest
-        # from extraction stragglers -- verified live that 4 attempts (~48s)
-        # was not always enough to clear it at a 150-row fanout, and a
-        # rate-limited reducer kills the WHOLE multi-minute run at its very
-        # last step.
+        # returns, i.e. exactly when the rate window is fullest from
+        # extraction stragglers; a rate-limited reducer kills the WHOLE
+        # multi-minute run at its very last step.
         outcome: dict = _invoke_ratelimit_retry(narrative_llm, [
             SystemMessage(content=system_prompt),
             HumanMessage(content=prompt),
         ], attempts=8, label="narrative", verbose=verbose)
-        parsed: NarrativeSummary | None = outcome.get("parsed")
-        error = outcome.get("parsing_error")
+        parsed: NarrativeSummary | None = (outcome or {}).get("parsed")
+        error = (outcome or {}).get("parsing_error")
 
         if parsed is not None and error is None:
             result = _finalize(SmartTableResponse(
@@ -4245,9 +3948,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
         """Dedupe every federated retrieval pool -- shared by
         continue_to_extraction (to build Send payloads) and
         synthesize_table_node (to answer directly from non-trial pools when
-        no trial was retrieved). A trial can legitimately appear more than
-        once if the agent issues overlapping tool calls in one round; same
-        reasoning for every other pool, each keyed on its own natural
+        no trial was retrieved). Each pool is keyed on its own natural
         identity field(s)."""
         seen: set[str] = set()
         trials: list[dict] = []
@@ -4292,10 +3993,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
         seen_news: set[tuple] = set()
         news_chunks: list[dict] = []
         for c in state.get("retrieved_news", []):
-            # SourceURL is the one identity field both news SourceTypes
-            # share (a press release has no AccessionNumber/PMCID; an
-            # earnings transcript has no Title/FeedName) -- see
-            # search_corporate_news's own payload shape.
+            # SourceURL is the one identity field both news SourceTypes share.
             key = (c.get("SourceURL"), c.get("ChunkIndex"))
             if key not in seen_news:
                 seen_news.add(key)
@@ -4324,14 +4022,10 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
            complete verified set -- so completeness never depends on which
            tools the agent happened to call, and the TRUE total is known.
         3. PRECISION FILTER: keep a trial iff it verifiably contains at
-           least one asked entity (boundary-regex over its text, or
-           membership in the entity's graph-verified set). Skipped
-           entirely when the question named no exact entity -- class and
-           topic queries are never filtered.
+           least one asked entity. Skipped entirely when the question named
+           no exact entity -- class and topic queries are never filtered.
         4. Question-aware rerank for ORDERING (+ junk gate on non-entity
-           queries), capped at POOL_MAX_TRIALS; min-keep is bounded by
-           the FILTERED pool so filtered-out lookalikes can never be
-           resurrected.
+           queries), capped at POOL_MAX_TRIALS.
         """
         if state.get("has_results") is False:
             return {}
@@ -4374,9 +4068,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                 aliases = _expand_entity_aliases(ent["name"], kind)
                 patterns = [p for p in (_alias_pattern(a) for a in aliases) if p]
                 # Combination asks intersect the per-entity sets, so each
-                # set must be fetched whole -- a per-entity top-150 would
-                # drop intersection members that are merely older in one
-                # entity's ordering. The cap is re-applied after the
+                # set must be fetched whole; the cap is re-applied after the
                 # intersection below.
                 exact_trials, ent_total, verified_ncts = fetch_trials_exact(
                     aliases, kind,
@@ -4427,8 +4119,6 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                                 if per_entity_verified else set())
             else:
                 verified_set = set().union(*per_entity_verified)
-            # Pool rows that pass the regex gate but were outside the
-            # engines' reach still verifiably match -- count them.
             total_matching = len(verified_set | kept_ids)
             if verbose:
                 print(f"[prepare] entity filter "
@@ -4465,8 +4155,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
             # CLASS / TARGET COMPLETENESS: resolve the asked class through
             # the drug KB to its member substances and fetch every trial
             # that STUDIES one of them -- the class analogue of the exact-
-            # entity backfill, so "GLP-1 agonists in obesity" is a verified
-            # member set with a true total, not kNN's nearest 60.
+            # entity backfill.
             class_terms = (list(constraints.get("drug_classes") or [])
                            + list(constraints.get("targets") or []))
             if class_terms:
@@ -4519,9 +4208,9 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                               or constraints.get("design"))
         pool_cap = CLASS_FETCH_CAP if needs_verifier else POOL_MAX_TRIALS
 
-        # Question-aware ORDERING rerank (moved here from _deduped_pools);
-        # for entity queries the pool is already exact, so the junk gate
-        # only applies when no entity filter ran (kNN neighbors present).
+        # Question-aware ORDERING rerank; for entity queries the pool is
+        # already exact, so the junk gate only applies when no entity filter
+        # ran (kNN neighbors present).
         if question and len(trials) > 1:
             import reranker as _rr
             if _rr.enabled():
@@ -4539,11 +4228,8 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                 if asked or "class" in enforced:
                     # Exact / KB-verified pool: every row satisfies the ask
                     # equally, so the cap must follow the analyst ordering
-                    # the coverage note promises (latest phase, live,
-                    # newest) -- not the cross-encoder's opinion, which
-                    # scores a T2D semaglutide trial low against an obesity
-                    # question and would silently undo completeness. Rerank
-                    # scores stay on the dicts for diagnostics only.
+                    # the coverage note promises -- not the cross-encoder's
+                    # opinion.
                     trials = sorted(ranked, key=_trial_analyst_key)
                 else:
                     kept = [t for t in ranked
@@ -4561,7 +4247,7 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
         # Drug KB facts for every studied agent in the final pool -- ONE
         # batched lookup here, broadcast to all workers as a shared pool
         # (so the mechanism column is set deterministically, never by
-        # recall). Keyed by the registry intervention name as written.
+        # recall).
         studied_names = sorted({n for t in trials
                                 for n in _studied_intervention_names(t)})
         drug_facts = get_drug_mechanisms(studied_names) if studied_names else {}
@@ -4590,11 +4276,10 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
 
     def route_after_prepare(state: AgentState) -> str:
         """One bounded corrective retrieval round for THIN class/topic
-        pools: when no exact entity was asked (entity pools are complete by
-        construction), fewer than CORRECTIVE_MIN_ROWS candidates survived
-        the deterministic filters, and the agent still has a tool round
-        left, hand control back to the agent with a note saying what to
-        broaden. Otherwise proceed to verification."""
+        pools: when no exact entity was asked, fewer than
+        CORRECTIVE_MIN_ROWS candidates survived the deterministic filters,
+        and the agent still has a tool round left, hand control back to the
+        agent with a note saying what to broaden."""
         if state.get("has_results") is False:
             return "verify"
         pools = state.get("prepared_pools") or {}
@@ -4743,16 +4428,14 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
                 "coverage_note": note}
 
     def continue_to_extraction(state: AgentState):
-        """Conditional edge from `tools` -- the Mapper.
+        """Conditional edge after verify_candidates -- the Mapper.
 
-        Folds in the pre-existing NoResultsFallback guardrail (a plain node
-        name, no LLM call) so an ungrounded search still fails closed exactly
-        as before. Otherwise, dedupes every federated pool (see
-        _deduped_pools) and returns one Send per distinct trial -- this is
-        what dynamically spawns N parallel extract_trial branches at
-        runtime, N being however many trials Qdrant actually returned. Every
-        deduped non-trial pool is broadcast into EVERY Send -- each worker
-        independently judges which excerpts (if any) belong to its trial.
+        Folds in the NoResultsFallback guardrail (a plain node name, no LLM
+        call) so an ungrounded search still fails closed. Otherwise returns
+        one Send per distinct trial -- this is what dynamically spawns N
+        parallel extract_trial branches at runtime. Every deduped non-trial
+        pool is broadcast into EVERY Send; each worker independently judges
+        which excerpts (if any) belong to its trial.
         """
         if state.get("has_results") is False:
             return "no_results_fallback"
@@ -4761,21 +4444,11 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
         trials = pools["trials"]
 
         if not trials:
-            # has_results is True (checked above) but there is no trial to
-            # spawn a Map worker for -- either a generic query grounded on an
-            # empty token set (pre-existing edge case), or the agent called
-            # only non-trial tools this round (search_pdf_literature,
-            # search_fda_records, search_pubmed_literature,
-            # search_sec_filings -- any combination), so has_results came
-            # from one of those alone and search_clinical_trials /
-            # query_knowledge_graph never ran. None of those sources can
-            # back a table row on its own (nct_id must come from a trial
-            # record) -- route to the Reducer rather than returning an empty
-            # Send list, which would silently dead-end the graph (no further
-            # supersteps run, "result" is never set). synthesize_table
-            # handles this case directly: it writes a real narrative from
-            # whichever non-trial pools ARE non-empty instead of assuming
-            # "no trial" means "no evidence at all."
+            # has_results is True but there is no trial to spawn a Map
+            # worker for (the agent called only non-trial tools). Route to
+            # the Reducer rather than returning an empty Send list, which
+            # would silently dead-end the graph. synthesize_table writes a
+            # real narrative from whichever non-trial pools ARE non-empty.
             if verbose:
                 print(f"\n{'─' * 78}\n▶ MAPPER: continue_to_extraction\n{'─' * 78}")
                 print("  has_results=True but no distinct trial retrieved -- "
@@ -4835,11 +4508,6 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
 
     g.add_conditional_edges("agent", route, {"tools": "tools", "synthesis": "synthesize_table",
                                              "verify": "verify_candidates"})
-    # `tools` fans out via Send (Map), falls through to NoResultsFallback, or
-    # (federated-retrieval edge case: literature grounded the round but no
-    # trial was retrieved to attach it to) goes straight to the Reducer --
-    # continue_to_extraction returns whichever fits; path_map only needs to
-    # cover the plain-string branches, Send objects are used directly.
     g.add_edge("tools", "prepare_extraction")
     # prepare -> (thin class pool? one corrective agent round) -> verify
     # -> Send fanout. The corrective path re-enters agent -> tools ->
@@ -4857,10 +4525,8 @@ def make_graph(model: str, verbose: bool = True, checkpointer=None):
     g.add_conditional_edges("synthesize_table", route_after_synthesis,
                             {"retry": "synthesize_table", "done": END})
 
-    # checkpointer (worker.py passes a PostgresSaver) makes runs durable:
-    # thread_id-keyed state snapshots after every super-step, so a killed
-    # run resumes instead of restarting. None (the API/CLI default) keeps
-    # the original stateless behavior.
+    # checkpointer (worker.py passes a PostgresSaver) makes runs durable.
+    # None (the API/CLI default) keeps the original stateless behavior.
     return g.compile(checkpointer=checkpointer)
 
 
@@ -4880,7 +4546,8 @@ def _text_of(msg) -> str:
 
 
 def _trace_intent(verdict: IntentClassification) -> None:
-    print(f"\n{'─' * 78}\n▶ NODE: IntentClassifier  (model={INTENT_MODEL})\n{'─' * 78}")
+    label = CUSTOM_MODEL if _provider() == "custom" else INTENT_MODEL
+    print(f"\n{'─' * 78}\n▶ NODE: IntentClassifier  (model={label})\n{'─' * 78}")
     print(f"  is_in_domain = {verdict.is_in_domain}")
     print(f"  reason       = {verdict.reason}")
     ents = [f"{e.name}/{e.kind}" for e in (verdict.exact_entities or [])]
@@ -4905,13 +4572,9 @@ def _trace_agent(reply, round_no: int) -> None:
 
 
 def _trace_tool_result(msg) -> None:
-    # Three different tools land here, each with its own payload shape --
-    # printed with a tool-specific label so the trace makes it unambiguous
-    # which corpus was actually hit, not just that "a" tool ran. Checked by
-    # tool_name explicitly (not by which JSON keys are present) because
-    # query_knowledge_graph's payload ALSO has a "trials" key -- same shape
-    # deliberately, so it flows through the Map-Reduce pipeline unchanged --
-    # and would otherwise be misdetected as search_clinical_trials.
+    # Checked by tool_name explicitly (not by which JSON keys are present)
+    # because query_knowledge_graph's payload ALSO has a "trials" key and
+    # would otherwise be misdetected as search_clinical_trials.
     tool_name = getattr(msg, "name", None) or "?"
     print(f"\n{'─' * 78}\n▶ NODE: Tool Node  (tool={tool_name})\n{'─' * 78}")
     try:
@@ -4992,19 +4655,16 @@ def _trace_tool_result(msg) -> None:
             else:
                 label = f"{c.get('FeedName')}: {textwrap.shorten(c.get('Title') or '', 45, placeholder='…')}"
             print(f"    • {label}  score={c.get('score')}")
+    else:
+        print(f"  {textwrap.shorten(json.dumps(payload), 300, placeholder='…')}")
 
 
 # =============================================================================
 # INDICATION LANDSCAPE MATRIX -- mechanism/target rows x development-phase
-# columns, for a single therapeutic area. A separate, deliberately SIMPLER
-# pipeline than the six-tool ReACT agent above -- not a graph the caller
-# steers with tool calls, but one fixed retrieve-then-synthesize shape,
-# because a competitive-landscape MATRIX genuinely needs a cross-cutting
-# view of ALL retrieved evidence at once to group drugs by shared mechanism
-# (the same reason literature dedup needs the full pool, not a per-trial
-# Map-Reduce worker that only ever sees one trial in isolation -- see
-# extract_trial_node's own docstring for that same tradeoff elsewhere in
-# this file).
+# columns, for a single therapeutic area. A deliberately SIMPLER pipeline
+# than the ReACT agent above: one fixed retrieve-then-synthesize shape,
+# because a competitive-landscape MATRIX needs a cross-cutting view of ALL
+# retrieved evidence at once to group drugs by shared mechanism.
 # =============================================================================
 class DrugEntry(BaseModel):
     """One drug placed in one phase cell of the landscape matrix."""
@@ -5092,85 +4752,39 @@ class LandscapeMatrix(BaseModel):
 
 LANDSCAPE_PHASES = ["Preclinical", "Phase 1", "Phase 2", "Phase 3", "Approved"]
 
-# Broader than the six-tool agent's per-call limit=6 -- a landscape needs
-# enough breadth to surface multiple competing mechanisms, not just the top
-# handful of nearest neighbours. Bounded, not unlimited: kept small enough
-# that trials(40) + fda(20) + pubmed(20) stays a few thousand tokens of
-# retrieved evidence per call, not something that risks the LLM's context
-# window or the endpoint's latency budget.
-# Restored to a comprehensive 50/20/20 after two other fixes made the
-# earlier 25/12/12 cut unnecessary: (1) LANDSCAPE_MAX_TOKENS is now a
-# genuinely generous 40000 (verified live to absorb kimi-k3's ~16K-token
-# reasoning overhead AND a full JSON matrix -- see that constant's own
-# comment), and (2) LANDSCAPE_SYSTEM now caps mechanism ROWS directly
-# (6-10 clinical-grade groups), which bounds output size on the row axis
-# regardless of how much input evidence is fed in. The earlier 25/12/12
-# traded away real result breadth to chase a token ceiling that a bigger
-# budget + a row cap now handle properly -- verified live that this
-# under-covered a large indication like NSCLC (only 4 rows, 19/23 drugs
-# stuck in the "no mechanism" bucket).
-# Raised 50 -> 60 alongside TRIAL_SEARCH_LIMIT/CATALYST_TRIAL_LIMIT per
-# explicit request ("limit it to max 60 at least") -- same "broad, not
-# exploratory" reasoning above still applies at the new ceiling.
+# Broad retrieval: a landscape needs enough breadth to surface multiple
+# competing mechanisms, not just the top handful of nearest neighbours.
 LANDSCAPE_TRIAL_LIMIT = 60
 LANDSCAPE_FDA_LIMIT = 20
 LANDSCAPE_PUBMED_LIMIT = 20
 
-# Verified live to matter, not a guess: MAX_TOKENS (8000, tuned for a
-# narrative answer) truncated a real matrix response mid-JSON -- a live run
-# hit completion_tokens=8000 exactly and failed to parse. A full multi-
-# mechanism x 5-phase grid with several drugs per cell is a structurally
-# bigger output than one paragraph of prose, so this pipeline gets its own,
-# larger budget rather than sharing MAX_TOKENS.
-#
-# Raised again, substantially, after switching to LLM_PROVIDER=kimi:
-# verified live that kimi-k3 is a reasoning model whose internal chain-of-
-# thought competes with visible output for the SAME max_tokens budget --
-# a real run against this exact prompt spent reasoning_tokens=15997 of a
-# 16000-token budget on reasoning alone, leaving ~0 for the actual JSON
-# (openai.LengthFinishReasonError). Same class of issue INTENT_MODEL's own
-# max_tokens=1536 comment already documents for NVIDIA's Nemotron, just
-# larger here because this prompt's evidence bundle is much bigger than an
-# intent check. This is comfortable headroom for reasoning AND a full
-# matrix, not a tight fit -- err generous, since a too-small budget fails
-# closed with a confusing parse error rather than a clean truncation.
+# A full multi-mechanism x 5-phase grid is a structurally bigger output than
+# one paragraph of prose, so this pipeline gets its own, larger budget.
+# NOTE: under the custom provider _build_custom_llm clamps max_tokens to
+# CUSTOM_MAX_TOKENS; raise that env var if the matrix gets truncated.
 LANDSCAPE_MAX_TOKENS = 40000
 
-# Also verified live to matter: build_llm's default timeout=180 is tuned for
-# a normal agent turn, not a ~20K-input-token / up-to-16K-output-token
-# structured-extraction call. A live run under LLM_PROVIDER=nvidia hit
-# openai.APITimeoutError at 180s, got retried by the SDK's own internal
-# retry logic, and STILL failed the same way on the retry -- 180s was never
-# enough for this workload's first attempt to finish, so retrying it
-# unchanged just repeats the same failure slower. A longer single-attempt
-# budget gives the real work a chance to complete instead.
+# A ~20K-input-token structured-extraction call needs a longer single-
+# attempt budget than a normal agent turn.
 LANDSCAPE_TIMEOUT = 420
 
-# A trial's own Phase field can be multi-valued (e.g. dual-phase "Phase
-# 1/Phase 2"). Early Phase 1 counts as Phase 1 for bucketing; Phase 4 and
-# Not Applicable are deliberately excluded from this map (see
-# _max_phase_bucket's docstring for why).
+# A trial's own Phase field can be multi-valued (e.g. "Phase 1/Phase 2").
+# Early Phase 1 counts as Phase 1; Phase 4 and Not Applicable are
+# deliberately excluded (see _max_phase_bucket).
 _PHASE_RANK = {"Early Phase 1": 1, "Phase 1": 1, "Phase 2": 2, "Phase 3": 3}
 
 
 def _max_phase_bucket(phases: list[str] | None) -> str | None:
     """Collapse a trial's Phase field to the SINGLE most-advanced bucket
-    among {Phase 1, Phase 2, Phase 3} for landscape placement -- the
-    standard competitive-landscape convention of showing a drug at its most
-    advanced reached stage, not every stage it ever passed through.
+    among {Phase 1, Phase 2, Phase 3} for landscape placement.
 
     Deliberately DETERMINISTIC, computed in code rather than left to the
-    LLM: phase bucketing from a trial's own structured Phase array is a pure
-    data-mapping task with one correct answer, and doing it in code removes
-    a whole axis of possible LLM error from a task that has zero need for
-    language understanding. The LLM's job (see LANDSCAPE_SYSTEM) is to use
-    this precomputed field, not re-derive it.
+    LLM: phase bucketing from a structured Phase array is a pure
+    data-mapping task with one correct answer.
 
-    "Not Applicable" (device/behavioral trials) and "Phase 4" are
-    deliberately NOT bucketed here: Phase 4 trials only exist for
-    already-approved drugs, which is an approval signal, not a development
-    phase -- see the module docstring's Approved-column reasoning; Not
-    Applicable trials carry no drug-development-stage information at all.
+    "Not Applicable" and "Phase 4" are NOT bucketed: Phase 4 trials only
+    exist for already-approved drugs (an approval signal, not a development
+    phase); Not Applicable trials carry no development-stage information.
     """
     if not phases:
         return None
@@ -5180,30 +4794,15 @@ def _max_phase_bucket(phases: list[str] | None) -> str | None:
 
 def _retrieve_landscape_evidence(therapeutic_area: str) -> dict:
     """Broad retrieval across three independent corpora for one therapeutic
-    area -- trials (for phase placement, via the precomputed phase_bucket
-    field), FDA approval records (real regulator-confirmed ground truth for
-    the Approved column), and PubMed literature (for mechanism/target
-    language and the rare explicit Preclinical mention). Each retrieval is a
-    single kNN query against its own collection with the SAME query vector
-    -- no cross-collection filtering, since a therapeutic area is a topic,
-    not an exact-match field any of these three schemas carries.
-
-    Text fields are truncated (not omitted) to keep the combined evidence
-    bundle a few thousand tokens rather than growing unboundedly with
-    LANDSCAPE_TRIAL_LIMIT/LANDSCAPE_PUBMED_LIMIT -- BriefSummary/Text is
-    still long enough to state a mechanism in a sentence or two, which is
-    all the synthesis step actually needs from it.
-    """
+    area -- trials (phase placement via the precomputed phase_bucket), FDA
+    approval records (ground truth for the Approved column), and PubMed
+    literature (mechanism language and the rare explicit Preclinical
+    mention). Same query vector for all three."""
     query_vector = embed_query(therapeutic_area)
 
-    # Hard-filtered to INTERVENTIONAL studies only -- verified live against
-    # this exact corpus that a bare semantic query over a common indication
-    # returns a majority OBSERVATIONAL/EXPANDED_ACCESS studies (33 of the
-    # top 40 for "Non-Small Cell Lung Cancer" in one live check), and
-    # observational studies structurally never carry a Phase value (Phase
-    # only applies to interventional trials on ClinicalTrials.gov) -- so
-    # they can never contribute a phase-bucketed matrix cell at all. Same
-    # hybrid filter+vector pattern as search_clinical_trials' phase_filter.
+    # Hard-filtered to INTERVENTIONAL studies only: observational studies
+    # structurally never carry a Phase value, so they can never contribute a
+    # phase-bucketed matrix cell.
     trial_hits = _client().query_points(
         collection_name=COLLECTION_NAME, query=query_vector, limit=LANDSCAPE_TRIAL_LIMIT,
         query_filter=qmodels.Filter(must=[qmodels.FieldCondition(
@@ -5224,9 +4823,9 @@ def _retrieve_landscape_evidence(therapeutic_area: str) -> dict:
             "BriefSummary": (meta.get("BriefSummary") or "")[:800],
         })
 
-    fda_hits = _client().query_points(
+    fda_hits = _safe_query_points(
         collection_name=COLLECTION_NAME_FDA, query=query_vector, limit=LANDSCAPE_FDA_LIMIT
-    ).points
+    )
     fda_records = []
     for h in fda_hits:
         meta = h.payload or {}
@@ -5237,9 +4836,9 @@ def _retrieve_landscape_evidence(therapeutic_area: str) -> dict:
             "ActiveIngredients": meta.get("ActiveIngredients"),
         })
 
-    pubmed_hits = _client().query_points(
+    pubmed_hits = _safe_query_points(
         collection_name=COLLECTION_NAME_PUBMED, query=query_vector, limit=LANDSCAPE_PUBMED_LIMIT
-    ).points
+    )
     pubmed_chunks = []
     for h in pubmed_hits:
         meta = h.payload or {}
@@ -5370,37 +4969,20 @@ _PMCID_RE = re.compile(r"^PMC\d+$")
 
 
 def _sanitize_landscape_matrix(matrix: LandscapeMatrix) -> LandscapeMatrix:
-    """Deterministic backstop over the LLM's own output -- verified live to
-    matter, not defensive-for-its-own-sake: a real run placed the same
-    drug in BOTH Preclinical and Approved, citing the SAME FDA application
-    number as its Preclinical "source" (an FDA record cannot state
-    preclinical status; it is proof of the opposite). LANDSCAPE_SYSTEM now
-    says this explicitly, but a system prompt is not a validator -- this
-    function is, catching whatever the prompt still misses. Drops any
-    Preclinical DrugEntry whose source is not a genuine PMCID; every other
-    cell is left untouched, since only Preclinical has this single-source-
-    type constraint (see LANDSCAPE_SYSTEM)."""
+    """Deterministic backstop over the LLM's own output.
+
+    1. Drop any Preclinical DrugEntry whose source is not a genuine PMCID: an
+       FDA application number is proof of APPROVAL, the opposite of
+       preclinical.
+    2. Drop a duplicate from "Other / Unspecified Mechanism" whenever that
+       same drug name (case-insensitive) already has a real classification
+       elsewhere -- the specific classification wins. This does NOT resolve
+       a conflict between two DIFFERENT specific classifications."""
     for row in matrix.rows:
         for cell in row.cells:
             if cell.phase == "Preclinical":
                 cell.drugs = [d for d in cell.drugs if _PMCID_RE.match(d.source)]
 
-    # Second backstop, also verified live to matter: a real run classified
-    # "Nilotinib" as a specific (and wrong) target class in one row, then
-    # ALSO listed it again under "Other / Unspecified Mechanism" -- the
-    # same drug, inconsistently mechanism-tagged twice in one response.
-    # LANDSCAPE_SYSTEM now explicitly says "never classify the SAME drug
-    # differently in two different rows," but the same principle applies
-    # here: don't trust the prompt alone to enforce it. Drop a duplicate
-    # from "Other / Unspecified Mechanism" whenever that same drug name
-    # (case-insensitive) already has a real classification elsewhere --
-    # whatever specific classification the model committed to first wins,
-    # and the redundant, less-informative "unspecified" duplicate is
-    # removed rather than left to confuse the grid. This does NOT resolve
-    # a genuine conflict between two DIFFERENT specific classifications
-    # for the same drug (rare, and not distinguishable after the fact
-    # without re-querying the model) -- only the specific-vs-unspecified
-    # duplicate this live run actually produced.
     OTHER = "Other / Unspecified Mechanism"
     classified_names = {
         d.name.strip().lower()
@@ -5431,62 +5013,46 @@ class LandscapeState(TypedDict):
 def _build_gpt4o_llm(timeout: int, model_env_var: str = "LANDSCAPE_MODEL",
                      default_model: str = "gpt-4o"):
     """Shared builder for every evidence-heavy structured-extraction call in
-    this file (landscape matrix synthesis, catalyst timeline synthesis)
-    that is deliberately PINNED to OpenAI gpt-4o, not routed through
-    build_llm()'s LLM_PROVIDER switch -- unlike every other LLM call in
-    this file, which follows whatever LLM_PROVIDER is set to.
+    this file (extraction cascade, class expansion, verifier, narrative,
+    landscape matrix, catalyst timeline, AACT SQL). The name is historical
+    (it once pinned OpenAI gpt-4o); it is kept so no call site changes.
 
-    Verified live, in order, why the two temporary fallbacks that work fine
-    for the main agent's much smaller calls both broke on this shape of call:
-    - LLM_PROVIDER=nvidia: Nemotron is a reasoning model whose internal
-      chain-of-thought competes with visible output for the same
-      max_tokens budget -- fine for a small intent check, but an evidence-
-      heavy prompt like this pushed real landscape-matrix runs past a
-      420s timeout entirely (measured: 802s for one successful run).
-    - LLM_PROVIDER=kimi: kimi-k3 has the same reasoning-overhead problem
-      (one real run spent reasoning_tokens=15997 of a 16000 budget on
-      thinking alone, leaving ~0 for output), AND this account's key hits
-      a hard "max organization concurrency: 1" quota -- verified live that
-      even a single clean, isolated first attempt gets rejected outright,
-      not just overlapping retries.
-    gpt-4o is a non-reasoning chat model with no chain-of-thought token
-    overhead and no such concurrency ceiling, and OPENAI_API_KEY is
-    already a hard requirement of this whole project (embeddings.py), not
-    a new secret being introduced for this call.
+    Routing:
+      * LLM_PROVIDER=custom (DEFAULT) -> the Unistra gateway model. Per-
+        feature overrides: CUSTOM_<model_env_var> (e.g. CUSTOM_NARRATIVE_MODEL).
+      * any other provider -> Groq (OpenAI-compatible). `model_env_var`
+        overrides directly; call sites passing default_model containing
+        "mini" get GROQ_FAST_MODEL, everything else GROQ_MAIN_MODEL.
 
-    temperature=0 here (unlike the rest of this file, which never sets
-    temperature because claude-opus-5 rejects it with a 400): gpt-4o
-    supports it, and this call benefits from it -- consistent, minimally
-    creative extraction/classification output run after run, not narrative
-    prose where some variation is harmless.
-
-    `model_env_var` lets each caller offer its own override (e.g.
-    LANDSCAPE_MODEL vs CATALYST_MODEL) without a shared knob accidentally
-    changing both features' model choice at once.
+    Callers must request structured output with method=STRUCTURED_METHOD
+    (default function_calling): many OpenAI-compatible servers reject
+    json_schema response_format, and recent langchain-openai defaults to it.
     """
+    if _provider() == "custom":
+        return _build_custom_llm(
+            timeout, model_env_var=model_env_var,
+            mini=("mini" in default_model))
+
     from langchain_openai import ChatOpenAI
 
-    key = os.getenv("OPENAI_API_KEY")
+    key = os.getenv("GROQ_API_KEY")
     if not key:
         raise SystemExit(
-            "[gpt4o]   OPENAI_API_KEY is not set.\n"
-            "          Required (embeddings.py also depends on it) -- add it to .env."
+            "[groq]    GROQ_API_KEY is not set.\n"
+            "          Add it to .env — key at https://console.groq.com/keys\n"
+            "          (or use LLM_PROVIDER=custom with CUSTOM_LLM_API_KEY)"
         )
+    fallback_model = GROQ_FAST_MODEL if "mini" in default_model else GROQ_MAIN_MODEL
     return ChatOpenAI(
-        model=os.getenv(model_env_var, default_model),
+        model=os.getenv(model_env_var, fallback_model),
         temperature=0,
         api_key=key,
-        # Verified live that gpt-4o hard-rejects any max_tokens above 16384
-        # with a 400 (invalid_request_error) -- this is still ample
-        # headroom, since gpt-4o has no invisible chain-of-thought
-        # competing for the same budget the way kimi-k3/Nemotron did, so
-        # the full budget is available for actual JSON output.
+        base_url=GROQ_BASE_URL,
         max_tokens=16384,
         timeout=timeout,
-        # Same reasoning as build_llm's nvidia/kimi branches: the calling
-        # node's own MAX_SYNTHESIS_RETRIES loop is the one retry layer, so
-        # the SDK never has two requests in flight for the same logical
-        # attempt.
+        # The calling node's own MAX_SYNTHESIS_RETRIES loop is the one retry
+        # layer, so the SDK never has two requests in flight for the same
+        # logical attempt.
         max_retries=0,
     )
 
@@ -5494,15 +5060,12 @@ def _build_gpt4o_llm(timeout: int, model_env_var: str = "LANDSCAPE_MODEL",
 def make_landscape_graph(model: str, verbose: bool = True):
     """Two-node graph: retrieve (broad, three corpora) -> synthesize (one
     structured-output call over ALL retrieved evidence at once, with a
-    bounded self-retry on schema validation failure -- same
-    validate-or-retry shape as synthesize_table_node's Reduce stage
-    elsewhere in this file, reusing MAX_SYNTHESIS_RETRIES for consistency).
+    bounded self-retry on schema validation failure).
 
     `model` is accepted for signature consistency with make_graph() but
-    UNUSED here -- see _build_gpt4o_llm's own docstring for why this
-    graph pins its model choice instead of following LLM_PROVIDER."""
+    UNUSED here -- see _build_gpt4o_llm for how the model is chosen."""
     landscape_llm = _build_gpt4o_llm(LANDSCAPE_TIMEOUT).with_structured_output(
-        LandscapeMatrix, include_raw=True
+        LandscapeMatrix, include_raw=True, method=STRUCTURED_METHOD
     )
 
     def retrieve_node(state: LandscapeState) -> dict:
@@ -5530,10 +5093,7 @@ def make_landscape_graph(model: str, verbose: bool = True):
         )
         prior_error = state.get("error")
         # Only worth re-prompting on a genuine schema-validation failure --
-        # a transient API error (rate limit / timeout, see the except block
-        # below) says nothing about what the model produced, so there is
-        # nothing for it to "correct" and injecting that text would be
-        # actively misleading on a retry.
+        # a transient API error says nothing about what the model produced.
         if prior_error and not prior_error.startswith("transient API error:"):
             prompt += (
                 f"\n\nYOUR PREVIOUS ATTEMPT FAILED SCHEMA VALIDATION:\n{prior_error}\n"
@@ -5548,14 +5108,8 @@ def make_landscape_graph(model: str, verbose: bool = True):
         except (openai.RateLimitError, openai.APITimeoutError,
                openai.APIConnectionError, openai.InternalServerError) as exc:
             # Same retry mechanism as a schema-validation failure, not an
-            # uncaught crash -- verified live to matter: without this, a
-            # transient 429/timeout on this large, slow call propagated all
-            # the way out of run_landscape_query as a raw exception instead
-            # of going through this node's own retry loop. build_llm's own
-            # max_retries=0 (see that function's comment) means the SDK
-            # itself no longer silently retries either, so THIS is now the
-            # only retry layer -- each attempt fully completes or fails
-            # before the next one starts, never two requests in flight.
+            # uncaught crash. With max_retries=0 on the client, THIS is the
+            # only retry layer -- never two requests in flight.
             retries = state.get("retries", 0) + 1
             if verbose:
                 print(f"[landscape] API error (attempt {retries}): {exc}")
@@ -5563,8 +5117,8 @@ def make_landscape_graph(model: str, verbose: bool = True):
                 time.sleep(5)  # brief backoff before the next full attempt
             return {"retries": retries, "error": f"transient API error: {exc}"}
 
-        parsed: LandscapeMatrix | None = outcome.get("parsed")
-        error = outcome.get("parsing_error")
+        parsed: LandscapeMatrix | None = (outcome or {}).get("parsed")
+        error = (outcome or {}).get("parsing_error")
 
         if parsed is not None and error is None:
             parsed = _sanitize_landscape_matrix(parsed)
@@ -5607,36 +5161,23 @@ def run_landscape_query(graph, therapeutic_area: str) -> LandscapeMatrix | None:
 # =============================================================================
 # CLINICAL CATALYST & READOUT TRACKER -- a chronological timeline of upcoming
 # market-moving events (trial data readouts, FDA decision dates) for a
-# therapeutic-area/event-type query. Same retrieve-then-synthesize shape and
-# gpt-4o pinning as the landscape matrix pipeline above, but with one
-# structural difference driven by what was verified live before writing
-# this: NEITHER of this project's already-ingested corpora stores the dates
-# this feature needs.
+# therapeutic-area/event-type query. Same retrieve-then-synthesize shape as
+# the landscape matrix, with one structural difference: NEITHER ingested
+# corpus stores the dates this feature needs.
 #
-#   - clinical_trials' own Qdrant payload (see fetch_and_embed_trials.py's
-#     API_FIELDS) never requested primaryCompletionDate/completionDate --
-#     confirmed directly by inspecting a real stored payload before writing
-#     a line of this. A catalyst tracker's entire value is real dates, so
-#     rather than leave this a silent gap or have the LLM guess, retrieve_node
-#     does ONE extra, live, unauthenticated, free ClinicalTrials.gov API call
-#     per request -- batched (filter.ids=NCT1,NCT2,...), verified live to
-#     return a real multi-trial batch in one round trip -- to fetch each
-#     retrieved trial's REAL primaryCompletionDateStruct/completionDateStruct.
-#   - SEC filings sometimes DO state a real date in free text -- verified
-#     live against the already-indexed sec_filings collection: a real chunk
-#     reads "The FDA set a PDUFA date of September 21, 2026" for Keytruda.
-#     No live lookup exists for this (there is no structured "PDUFA date"
-#     field anywhere to fetch); the LLM must read it out of retrieved text,
-#     same strict-grounding discipline as everywhere else in this file.
+#   - clinical_trials' Qdrant payload never requested
+#     primaryCompletionDate/completionDate, so retrieve_node does ONE extra
+#     live, free ClinicalTrials.gov API call per request (batched,
+#     filter.ids=NCT1,NCT2,...) to fetch each trial's REAL completion dates.
+#   - SEC filings and news sometimes DO state a real date in free text
+#     ("The FDA set a PDUFA date of September 21, 2026"); the LLM must read
+#     it out of retrieved text, same strict-grounding discipline as
+#     everywhere else.
 #
-# DATE COMPUTATION SPLIT (same principle as phase_bucket in the landscape
-# pipeline): the LLM's ONLY job re: dates is to CITE a real date substring
-# verbatim from evidence (CatalystEventDraft.raw_date) -- it never computes
-# year/quarter itself. _parse_catalyst_date() does that deterministically,
-# in code, after the fact. This removes date arithmetic from the set of
-# things an LLM could get subtly wrong, the same way removing phase-bucket
-# arithmetic from the landscape LLM's job removed a whole class of its
-# errors.
+# DATE COMPUTATION SPLIT: the LLM's ONLY job re: dates is to CITE a real
+# date substring verbatim from evidence (CatalystEventDraft.raw_date) -- it
+# never computes year/quarter itself. _parse_catalyst_date() does that
+# deterministically, in code, after the fact.
 # =============================================================================
 class CatalystEventDraft(BaseModel):
     """LLM-facing schema -- cites evidence, never computes a date itself."""
@@ -5719,32 +5260,24 @@ class CatalystTimeline(BaseModel):
     events: list[CatalystEvent] = Field(description="Chronologically sorted, earliest first.")
 
 
-# Raised 40 -> 60 per explicit request ("limit it to max 60 at least") --
-# same TRIAL_SEARCH_LIMIT/LANDSCAPE_TRIAL_LIMIT reasoning: verified live
-# that event count for a broad query varies run-to-run partly on
-# LLM-synthesis selectivity, not just retrieval breadth, so a higher
-# retrieval ceiling gives the synthesis step more real candidates to
-# choose from rather than being starved before it even gets to judge them.
+# Verified-live reasoning: event count for a broad query varies run-to-run
+# partly on LLM-synthesis selectivity, so a higher retrieval ceiling gives
+# the synthesis step more real candidates to choose from.
 CATALYST_TRIAL_LIMIT = 60
 CATALYST_SEC_LIMIT = 20
 CATALYST_TIMEOUT = 120
 
-# A catalyst tracker cares about events that HAVEN'T happened yet -- these
-# are the ClinicalTrials.gov overallStatus values consistent with a trial
-# still being underway (verified live against this corpus's own status
-# distribution before picking this set). COMPLETED/TERMINATED/WITHDRAWN
-# trials' data has already read out; not a future catalyst.
+# ClinicalTrials.gov overallStatus values consistent with a trial still
+# being underway. COMPLETED/TERMINATED/WITHDRAWN trials' data has already
+# read out; not a future catalyst.
 _UPCOMING_TRIAL_STATUSES = [
     "RECRUITING", "ACTIVE_NOT_RECRUITING", "NOT_YET_RECRUITING", "ENROLLING_BY_INVITATION",
 ]
 
-# Verified live to matter, not a guess: a bare semantic query for "Upcoming
-# Phase 3 readouts in Oncology" retrieved mostly Phase 1/Phase 2 trials --
-# only 2 of 40 were genuinely Phase 3 -- because embedding similarity does
-# not treat "Phase 3" as a hard constraint the way a real market-intel
-# query needs. This mirrors why search_clinical_trials's own phase_filter
-# is a hard Qdrant filter, not left to semantic ranking alone; this
-# extractor + the filter built from it applies that same fix here.
+# A bare semantic query for "Upcoming Phase 3 readouts" retrieves mostly
+# Phase 1/2 trials -- embedding similarity does not treat "Phase 3" as a hard
+# constraint. This extractor + the filter built from it applies the same fix
+# as search_clinical_trials's phase_filter.
 _PHASE_QUERY_RE = re.compile(r"\bphase\s*(1|2|3|4|iv|iii|ii|i)\b", re.IGNORECASE)
 _ROMAN_TO_ARABIC = {"i": "1", "ii": "2", "iii": "3", "iv": "4"}
 
@@ -5752,13 +5285,13 @@ _ROMAN_TO_ARABIC = {"i": "1", "ii": "2", "iii": "3", "iv": "4"}
 def _extract_phase_filter(query: str) -> str | None:
     """Best-effort hard-phase extraction from free-text query, e.g. 'Upcoming
     Phase 3 readouts' -> 'Phase 3'. Returns None (no filter applied) when
-    the query doesn't name a specific phase -- a query like 'Upcoming PDUFA
-    dates for oncology drugs' should NOT be phase-restricted."""
+    the query doesn't name a specific phase."""
     m = _PHASE_QUERY_RE.search(query)
     if not m:
         return None
     num = _ROMAN_TO_ARABIC.get(m.group(1).lower(), m.group(1))
     return PHASE_LABELS.get(f"PHASE{num}")
+
 
 _MONTH_TO_QUARTER = {1: "Q1", 2: "Q1", 3: "Q1", 4: "Q2", 5: "Q2", 6: "Q2",
                      7: "Q3", 8: "Q3", 9: "Q3", 10: "Q4", 11: "Q4", 12: "Q4"}
@@ -5771,26 +5304,20 @@ _YEAR_ONLY_RE = re.compile(r"^(\d{4})$")
 _Q_RE = re.compile(r"\bQ([1-4])[' ’]*(\d{4}|\d{2})\b", re.IGNORECASE)
 _H_RE = re.compile(r"\bH([12])[' ’]*(\d{4}|\d{2})\b", re.IGNORECASE)
 # SEC filing prose commonly says "second half of 2026" rather than "H2
-# 2027" -- verified live this phrasing needs its own explicit match: without
-# it, the free-text dateutil fallback below "parses" it by defaulting the
-# missing month to TODAY's month (dateutil's own default-date behavior),
-# which only coincidentally lands in the right half of the year and is
-# flatly wrong the rest of the time (e.g. parsed in February, "second half
-# of 2026" would wrongly resolve to Q1/Q2). This pattern must be checked
-# BEFORE that fallback.
+# 2026". Without an explicit match the free-text dateutil fallback "parses"
+# it by defaulting the missing month to TODAY's month -- flatly wrong most
+# of the time. This pattern must be checked BEFORE that fallback.
 _HALF_PHRASE_RE = re.compile(
     r"\b(first|1st|second|2nd|latter)\s+half\s+of\s+(\d{4})\b", re.IGNORECASE
 )
 
 
 def _parse_catalyst_date(raw: str) -> tuple[int, str, str] | None:
-    """Deterministic date parsing -- see this section's module-level
-    comment for why this is code, not LLM output. Tries, in order: ISO
-    full date, ISO year-month, explicit "Q# YYYY", explicit "H# YYYY",
-    bare year, then a free-text fallback via python-dateutil for prose
-    dates like "September 21, 2026" straight out of an SEC excerpt.
-    Returns None if genuinely no real year can be extracted -- the caller
-    drops that event rather than guess."""
+    """Deterministic date parsing. Tries, in order: ISO full date, ISO
+    year-month, explicit "Q# YYYY", explicit "H# YYYY", "first/second half
+    of YYYY", bare year, then a free-text fallback via python-dateutil for
+    prose dates like "September 21, 2026". Returns None if genuinely no real
+    year can be extracted -- the caller drops that event rather than guess."""
     raw = raw.strip()
 
     m = _ISO_FULL_RE.match(raw)
@@ -5836,21 +5363,17 @@ def _parse_catalyst_date(raw: str) -> tuple[int, str, str] | None:
         return None
     if not (1900 <= parsed.year <= 2100):
         return None
-    # raw itself (not a reformatted version) as the display string here --
-    # it is already real, human-readable prose extracted from the source
-    # (e.g. "September 21, 2026"), and reformatting risks implying more
-    # precision (e.g. a specific day) than the source actually stated.
+    # raw itself (not a reformatted version) as the display string: it is
+    # already real, human-readable prose from the source, and reformatting
+    # risks implying more precision than the source stated.
     return parsed.year, _MONTH_TO_QUARTER[parsed.month], raw
 
 
 def _enrich_trial_dates(nct_ids: list[str]) -> dict[str, dict]:
     """Live, unauthenticated, free ClinicalTrials.gov lookup for the real
     completion-date fields this project's own ingested corpus does not
-    store (see this section's module comment). Batched via filter.ids= --
-    verified live to return every requested trial's current data in ONE
-    round trip, not one call per trial. Best-effort: a failed lookup
-    returns {} rather than raising, so a transient network issue degrades
-    to "fewer dated events" rather than crashing the whole endpoint."""
+    store. Batched via filter.ids= -- ONE round trip, not one call per
+    trial. Best-effort: a failed lookup returns {} rather than raising."""
     if not nct_ids:
         return {}
     try:
@@ -5859,11 +5382,8 @@ def _enrich_trial_dates(nct_ids: list[str]) -> dict[str, dict]:
             params={
                 "filter.ids": ",".join(nct_ids),
                 # PrimaryCompletionDateType must be requested as its OWN
-                # field name -- verified live that omitting it (even
-                # though PrimaryCompletionDate is present) silently drops
-                # the ESTIMATED/ACTUAL distinction from the response
-                # rather than erroring, which a first version of this
-                # call did without ever noticing.
+                # field name -- omitting it silently drops the
+                # ESTIMATED/ACTUAL distinction from the response.
                 "fields": "NCTId,OverallStatus,PrimaryCompletionDate,PrimaryCompletionDateType,CompletionDate",
                 "pageSize": len(nct_ids),
             },
@@ -5892,12 +5412,10 @@ def _enrich_trial_dates(nct_ids: list[str]) -> dict[str, dict]:
 
 def _retrieve_catalyst_evidence(query: str) -> dict:
     """Broad retrieval across trials (hard-filtered to INTERVENTIONAL +
-    still-underway statuses, then live-enriched with real completion
-    dates) and SEC filings (for explicitly stated PDUFA/readout dates in
-    free text). Trials the live lookup returns no completion date for are
-    dropped here, not carried forward for the LLM to guess about -- a
-    trial with no real date is not something this feature can honestly
-    place on a timeline."""
+    still-underway statuses, then live-enriched with real completion dates),
+    SEC filings and corporate news (for explicitly stated PDUFA/readout
+    dates in free text). Trials with no real, not-yet-passed date are
+    dropped here rather than carried forward for the LLM to guess about."""
     query_vector = embed_query(query)
 
     must_conditions = [qmodels.FieldCondition(key="studyType", match=qmodels.MatchValue(value="INTERVENTIONAL"))]
@@ -5906,13 +5424,14 @@ def _retrieve_catalyst_evidence(query: str) -> dict:
         must_conditions.append(qmodels.FieldCondition(key="Phase", match=qmodels.MatchValue(value=phase_filter)))
         print(f"[catalysts] hard phase filter detected in query: {phase_filter!r}")
 
+    # A status ANY-match as a hard `must` (a `should` alongside a `must`
+    # would be only a ranking hint in Qdrant's semantics).
+    must_conditions.append(qmodels.FieldCondition(
+        key="OverallStatus", match=qmodels.MatchAny(any=_UPCOMING_TRIAL_STATUSES)))
+
     trial_hits = _client().query_points(
         collection_name=COLLECTION_NAME, query=query_vector, limit=CATALYST_TRIAL_LIMIT,
-        query_filter=qmodels.Filter(
-            must=must_conditions,
-            should=[qmodels.FieldCondition(key="OverallStatus", match=qmodels.MatchValue(value=s))
-                   for s in _UPCOMING_TRIAL_STATUSES],
-        ),
+        query_filter=qmodels.Filter(must=must_conditions),
     ).points
 
     trials = []
@@ -5936,27 +5455,16 @@ def _retrieve_catalyst_evidence(query: str) -> dict:
     dropped_past = 0
     for t in trials:
         d = date_lookup.get(t["NCTId"])
-        raw_date = d.get("primaryCompletionDate") or d.get("completionDate") if d else None
+        raw_date = (d.get("primaryCompletionDate") or d.get("completionDate")) if d else None
         if not raw_date:
             continue
-        # Filtering already-past trials HERE, not just at final synthesis
-        # (_finalize_catalyst_timeline has its own backstop for whatever
-        # slips through) -- verified live that leaving this only as a
-        # downstream check let a whole CATALYST_TRIAL_LIMIT-sized candidate
-        # pool skew toward trials that are administratively still "active"
-        # in the registry (see _UPCOMING_TRIAL_STATUSES) but already past
-        # their own stated completion date, starving the LLM of genuinely
-        # upcoming candidates to choose from and occasionally returning
-        # zero events on an otherwise-reasonable query. Best-effort parse:
-        # an unparseable date is dropped here too -- this feature can't
-        # honestly place an unparseable date on a timeline either way.
+        # Filtering already-past trials HERE, not just at final synthesis:
+        # leaving it only as a downstream check lets the candidate pool skew
+        # toward trials that are administratively still "active" in the
+        # registry but already past their own stated completion date.
         try:
             from dateutil import parser as _dateutil_parser
-            # default= needs a real datetime, not a date -- verified live:
-            # passing `today` (a date) directly makes dateutil return a
-            # date-typed result instead of a datetime, and .date() on THAT
-            # raises AttributeError ('date' object has no attribute
-            # 'date'). datetime.combine gives it what it actually wants.
+            # default= needs a real datetime, not a date.
             parsed_date = _dateutil_parser.parse(
                 raw_date, default=datetime.combine(today, datetime.min.time())
             ).date()
@@ -5971,9 +5479,9 @@ def _retrieve_catalyst_evidence(query: str) -> dict:
           f"real live-looked-up completion date that hasn't passed yet "
           f"({dropped_past} dropped as already past)")
 
-    sec_hits = _client().query_points(
+    sec_hits = _safe_query_points(
         collection_name=COLLECTION_NAME_SEC, query=query_vector, limit=CATALYST_SEC_LIMIT
-    ).points
+    )
     sec_chunks = []
     for h in sec_hits:
         meta = h.payload or {}
@@ -5987,18 +5495,16 @@ def _retrieve_catalyst_evidence(query: str) -> dict:
         })
 
     # Corporate news is where forward regulatory dates actually live: FDA
-    # never publishes PDUFA target action dates (21 CFR 314.430) -- every
-    # commercial catalyst calendar reconstructs them from press releases
-    # and earnings-call commentary, both of which this corpus indexes.
-    # The retrieval query is biased toward regulatory-timeline language on
-    # top of the user's own query so the ~20 slots aren't spent on general
-    # pipeline chatter.
-    news_hits = _client().query_points(
+    # never publishes PDUFA target action dates -- every commercial catalyst
+    # calendar reconstructs them from press releases and earnings-call
+    # commentary. The retrieval query is biased toward regulatory-timeline
+    # language so the slots aren't spent on general pipeline chatter.
+    news_hits = _safe_query_points(
         collection_name=COLLECTION_NAME_NEWS,
         query=embed_query(f"{query} PDUFA target action date FDA advisory "
                           f"committee priority review approval decision"),
         limit=CATALYST_SEC_LIMIT,
-    ).points
+    )
     news_chunks = []
     for h in news_hits:
         meta = h.payload or {}
@@ -6085,34 +5591,22 @@ class CatalystState(TypedDict):
     error: Optional[str]
 
 
-# Shared by _finalize_catalyst_timeline's sort AND its past-event filter --
-# hoisted to module scope so both use the exact same quarter ordering
-# rather than two dicts that could quietly drift apart. "" (year-only,
-# no quarter cited) sorts before any real quarter within its year.
+# Shared by _finalize_catalyst_timeline's sort AND its past-event filter.
+# "" (year-only, no quarter cited) sorts before any real quarter in its year.
 _QUARTER_RANK = {"": 0, "H1": 1, "Q1": 1, "Q2": 2, "H2": 3, "Q3": 3, "Q4": 4}
 
 
 def _finalize_catalyst_timeline(query: str, draft: CatalystTimelineDraft) -> CatalystTimeline:
     """Runs _parse_catalyst_date over every drafted event, drops any whose
-    raw_date genuinely can't be parsed (see that function's own docstring
-    for why that's the honest outcome rather than a guess) OR whose parsed
-    date has already passed, and sorts the survivors chronologically. This
-    is the code-side half of the LLM-cites/code-computes split described in
-    this section's module comment.
+    raw_date genuinely can't be parsed OR whose parsed date has already
+    passed, and sorts the survivors chronologically -- the code-side half of
+    the LLM-cites/code-computes split.
 
-    The past-date drop is a real, verified-live fix, not defensive
-    padding: _UPCOMING_TRIAL_STATUSES only filters on a trial's
-    OverallStatus (RECRUITING etc.), which is NOT the same guarantee as
-    "hasn't happened yet" -- a trial can genuinely still be marked active
-    in the registry well past its own stated completion date (a real,
-    common ClinicalTrials.gov data-quality gap). Widening
-    CATALYST_TRIAL_LIMIT surfaced exactly this: a live "Upcoming Phase 3
-    readouts in Oncology" query returned a "January 2024" event -- already
-    two years in the past at query time. The synthesis prompt already
-    instructs the model to only cite genuinely upcoming events, but isn't
-    perfectly reliable at that judgment against a wider candidate pool;
-    this is the deterministic backstop.
-    """
+    The past-date drop is a real fix, not padding: _UPCOMING_TRIAL_STATUSES
+    only filters on OverallStatus, which is NOT the same guarantee as "hasn't
+    happened yet" -- a trial can still be marked active in the registry well
+    past its own stated completion date. This is the deterministic backstop
+    for what the synthesis prompt alone doesn't reliably catch."""
     today = date.today()
     current_year = today.year
     current_quarter_rank = _QUARTER_RANK[f"Q{(today.month - 1) // 3 + 1}"]
@@ -6129,8 +5623,7 @@ def _finalize_catalyst_timeline(query: str, draft: CatalystTimelineDraft) -> Cat
         # A year-only citation (no quarter) in the CURRENT year is kept --
         # there's no finer-grained signal to judge "already passed this
         # year" from, and false-dropping a legitimate future event is worse
-        # than occasionally keeping one that's already happened within the
-        # same calendar year.
+        # than occasionally keeping one that already happened this year.
         if year < current_year:
             dropped_past += 1
             continue
@@ -6149,21 +5642,20 @@ def _finalize_catalyst_timeline(query: str, draft: CatalystTimelineDraft) -> Cat
         print(f"[catalysts] dropped {dropped_past} event(s) already in the past "
               f"(not a genuine upcoming catalyst)")
 
-    # Sort by (year, quarter-as-a-number) -- deterministic, not an LLM
-    # ordering claim.
+    # Sort by (year, quarter-as-a-number) -- deterministic, not an LLM claim.
     events.sort(key=lambda e: (e.year, _QUARTER_RANK.get(e.quarter, 5)))
 
     return CatalystTimeline(query=query, events=events)
 
 
 def make_catalyst_graph(verbose: bool = True):
-    """Two-node graph: retrieve (trials with live date enrichment + SEC
-    excerpts) -> synthesize (one structured-output call citing raw dates,
-    then deterministic parsing/sorting via _finalize_catalyst_timeline).
-    Pinned to gpt-4o like make_landscape_graph -- see _build_gpt4o_llm's
-    docstring for why."""
+    """Two-node graph: retrieve (trials with live date enrichment + SEC and
+    news excerpts) -> synthesize (one structured-output call citing raw
+    dates, then deterministic parsing/sorting via
+    _finalize_catalyst_timeline). Model chosen by _build_gpt4o_llm."""
     catalyst_llm = _build_gpt4o_llm(CATALYST_TIMEOUT, model_env_var="CATALYST_MODEL") \
-        .with_structured_output(CatalystTimelineDraft, include_raw=True)
+        .with_structured_output(CatalystTimelineDraft, include_raw=True,
+                                method=STRUCTURED_METHOD)
 
     def retrieve_node(state: CatalystState) -> dict:
         query = state["query"]
@@ -6209,8 +5701,8 @@ def make_catalyst_graph(verbose: bool = True):
                 time.sleep(5)
             return {"retries": retries, "error": f"transient API error: {exc}"}
 
-        draft: CatalystTimelineDraft | None = outcome.get("parsed")
-        error = outcome.get("parsing_error")
+        draft: CatalystTimelineDraft | None = (outcome or {}).get("parsed")
+        error = (outcome or {}).get("parsing_error")
 
         if draft is not None and error is None:
             result = _finalize_catalyst_timeline(state["query"], draft)
@@ -6255,11 +5747,27 @@ def run_catalyst_query(graph, query: str) -> CatalystTimeline | None:
 # =============================================================================
 def preflight() -> int:
     """Fail with actionable messages rather than a stack trace."""
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("[preflight] ANTHROPIC_API_KEY is not set.\n"
-              "            Add it to .env:  ANTHROPIC_API_KEY=sk-ant-...",
-              file=sys.stderr)
-        return 1
+    provider = _provider()
+    if provider == "custom":
+        if not os.getenv("CUSTOM_LLM_API_KEY"):
+            print("[preflight] CUSTOM_LLM_API_KEY is not set.\n"
+                  "            Add it to .env:  CUSTOM_LLM_API_KEY=...",
+                  file=sys.stderr)
+            return 1
+    else:  # legacy providers
+        if provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
+            print("[preflight] ANTHROPIC_API_KEY is not set.\n"
+                  "            Add it to .env:  ANTHROPIC_API_KEY=sk-ant-...\n"
+                  "            (or use LLM_PROVIDER=custom / groq)",
+                  file=sys.stderr)
+            return 1
+        if not os.getenv("GROQ_API_KEY"):
+            print("[preflight] GROQ_API_KEY is not set.\n"
+                  "            Add it to .env:  GROQ_API_KEY=gsk_...",
+                  file=sys.stderr)
+            return 1
+    # Query embeddings are whatever embeddings.py implements (local
+    # fastembed by default -- no key needed).
     try:
         c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
         if not c.collection_exists(COLLECTION_NAME):
@@ -6275,10 +5783,9 @@ def preflight() -> int:
         return 1
     print(f"[preflight] Qdrant OK — {n} points in '{COLLECTION_NAME}'")
 
-    # Soft checks only -- these two sources are newer and independently
-    # optional (each tool already fails closed with has_results=False if its
-    # collection is empty/missing), so a missing one should warn, not block
-    # the whole agent from running.
+    # Soft checks only -- these sources are independently optional (each tool
+    # already fails closed with has_results=False if its collection is
+    # empty/missing), so a missing one should warn, not block.
     for name, script in ((COLLECTION_NAME_PUBMED, "fetch_pubmed.py"),
                         (COLLECTION_NAME_SEC, "fetch_sec_edgar.py")):
         try:
@@ -6299,17 +5806,16 @@ VERIFICATION_QUESTION = (
     "sponsors, and key mechanisms."
 )
 
-# Previous milestones' questions, kept for regression runs:
-#   --question "What are the mechanisms of action for the Phase 3 oncology
-#               trials in our database?"
-#   --question "What is the best recipe for chocolate chip cookies?"          (AC2: OutOfDomain)
-#   --question "Compare Phase 3 trials for XYZ-Fake-Drug-999."                (AC3: NoResultsFallback)
+# Regression questions:
+#   --question "What is the best recipe for chocolate chip cookies?"   (OutOfDomain)
+#   --question "Compare Phase 3 trials for XYZ-Fake-Drug-999."         (NoResultsFallback)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--question", default=VERIFICATION_QUESTION)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="Anthropic model id (only used with LLM_PROVIDER=anthropic)")
     parser.add_argument("--quiet", action="store_true", help="hide the trace")
     args = parser.parse_args()
 
@@ -6318,7 +5824,14 @@ def main() -> int:
     print("=" * 78)
     if preflight() != 0:
         return 1
-    print(f"[preflight] model: {args.model}  |  intent gate: {INTENT_MODEL}")
+    if _provider() == "custom":
+        print(f"[preflight] provider: custom (Unistra)  |  model: {CUSTOM_MODEL}  |  "
+              f"structured output: {STRUCTURED_METHOD}  |  "
+              f"embeddings: {EMBEDDING_MODEL}")
+    else:
+        print(f"[preflight] provider: {_provider()}  |  model: {args.model}  |  "
+              f"intent gate: {INTENT_MODEL}  |  "
+              f"pinned tiers: Groq main={GROQ_MAIN_MODEL}, fast={GROQ_FAST_MODEL}")
 
     graph = make_graph(args.model, verbose=not args.quiet)
 
@@ -6385,9 +5898,7 @@ def main() -> int:
 
     payloads = _tool_payloads()
     # prepare_extraction's entity backfill is a legitimate retrieval source:
-    # it unions fetch_trials_exact's verified set into the pool so
-    # completeness never depends on the agent's tool choice -- those NCTs
-    # arrive via graph/Qdrant exact fetch, not a tool payload.
+    # those NCTs arrive via graph/Qdrant exact fetch, not a tool payload.
     backfilled = {t.get("NCTId")
                   for t in ((final.get("prepared_pools") or {}).get("trials") or [])
                   if t.get("NCTId")}
@@ -6405,9 +5916,7 @@ def main() -> int:
     cited = sorted(set(_re.findall(r"NCT\d{8}", result.narrative_summary)))
     row_ids = [r.nct_id for r in result.table_data]
     # sources_only mirrors synthesize_table_node's own condition: no table
-    # rows, but real evidence was retrieved from at least one non-trial tool
-    # -- e.g. AC4's corporate-strategy + mechanism question, which may
-    # legitimately never match a specific clinical trial.
+    # rows, but real evidence was retrieved from at least one non-trial tool.
     sources_only = not row_ids and bool(retrieved_pmcids or retrieved_accessions
                                         or retrieved_lit_count or retrieved_fda_count)
 
@@ -6457,6 +5966,7 @@ def main() -> int:
     print(f"  SEC accessions retrieved     : {len(retrieved_accessions)}")
     print(f"  narrative citations (NCTId)  : {len(cited)}")
     print(f"  table_data rows              : {len(row_ids)}")
+    bad_spans: list[str] = []
     if row_ids:
         print(f"  rows with >=1 intervention   : "
               f"{sum(1 for r in result.table_data if r.interventions)}/{len(row_ids)}")
@@ -6473,7 +5983,6 @@ def main() -> int:
         # Span validity: every trial_text mechanism must quote its own record.
         by_nct = {t.get("NCTId"): t for t in
                   (final.get("prepared_pools") or {}).get("trials") or []}
-        bad_spans = []
         for r in result.table_data:
             if r.mechanism_source == "trial_text" and r.nct_id in by_nct:
                 rec = _norm_ws(json.dumps(by_nct[r.nct_id]))
@@ -6497,11 +6006,9 @@ def main() -> int:
         print(f"  ✗ FAIL — duplicate rows: {dupes}"); ok = False
 
     if sources_only:
-        # This run's evidence never matched a specific trial (e.g. a
-        # corporate-strategy + mechanism question) -- an empty grid and zero
-        # NCTId citations are the CORRECT outcome here, not a failure. The
-        # real evidence bar instead: the narrative must actually cite
-        # something from the non-trial pools that grounded it.
+        # This run's evidence never matched a specific trial -- an empty grid
+        # and zero NCTId citations are the CORRECT outcome here. The real
+        # evidence bar instead: the narrative must actually say something.
         print(f"  (sources-only mode: empty table_data / no NCTId citations "
               f"is expected — evidence came from PubMed/SEC/literature/FDA, "
               f"not the trial registry)")

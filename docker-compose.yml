@@ -82,7 +82,7 @@ services:
       # occasionally hitting the wrong process. Pinning to 127.0.0.1
       # sidesteps the conflict entirely and is also a better security
       # default (not exposed to the LAN) for a local Compose stack.
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8080:8000"
     env_file:
       - .env
     environment:
@@ -96,6 +96,13 @@ services:
       # research_agent.py's bare-metal default of bolt://localhost:7687 to
       # reach the neo4j service by its Compose DNS name instead.
       NEO4J_URI: bolt://neo4j:7687
+      # PostgreSQL connection (service name inside compose network)
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: openbio
+      POSTGRES_PASSWORD: openbio
+      POSTGRES_DB: openbio
+      DATABASE_URL: postgresql://openbio:openbio@postgres:5432/openbio
     volumes:
       # FastEmbed cache ONLY. NOT ./qdrant_storage: the spec's Section 2
       # suggests mounting it into the backend too, but that directory is
@@ -106,6 +113,8 @@ services:
       # about which process owns that data; omitted deliberately.
       - fastembed_cache:/root/.cache/fastembed
     depends_on:
+      postgres:
+        condition: service_healthy
       qdrant:
         condition: service_healthy
       neo4j:
@@ -117,6 +126,31 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+  worker:
+    image: openbio-intel-backend
+    command: ["python", "worker.py"]
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      NEO4J_URI: bolt://neo4j:7687
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: openbio
+      POSTGRES_PASSWORD: openbio
+      POSTGRES_DB: openbio
+      DATABASE_URL: postgresql://openbio:openbio@postgres:5432/openbio
+    volumes:
+      - fastembed_cache:/root/.cache/fastembed
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
 
   frontend:
     build:
@@ -141,7 +175,7 @@ services:
         # "Run Analysis" fetch would silently hit the wrong server. Same root
         # cause already fixed once in frontend/app/page.tsx's local-dev
         # default; this repeats that fix at the container-build boundary.
-        NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
+        NEXT_PUBLIC_API_URL: http://127.0.0.1:8080
     ports:
       - "3000:3000"
     depends_on:
